@@ -1,15 +1,19 @@
 """Main-push-vahti: jokaisen mainiin tulevan commitin on tultava yhdistetyn PR:n kautta.
 
-Jälkitarkistus (agent-foundation D023 J2). Ajetaan GitHub Actionsissa, kun mainiin pushataan.
-Vain vakiokirjasto. Paluukoodit: 0 = kunnossa tai ei tarkistettavaa, 1 = suora push havaittu,
-2 = tarkistus ei valmistunut (API-virhe tai puutteellinen ympäristö).
+Jälkitarkistus (agent-foundation D023 J2). Ajetaan GitHub Actionsissa, kun mainiin
+pushataan. Vain vakiokirjasto. Paluukoodit: 0 = kunnossa tai ei tarkistettavaa,
+1 = suora push havaittu, 2 = tarkistus ei valmistunut.
 
 Kaksi ehtoa:
-1. Jokaisella pushin commitilla on PR-kytkentä (GET /repos/{owner}/{repo}/commits/{sha}/pulls)
-   PR:ään, joka on yhdistetty (merged_at) ja jonka kohde on main.
-2. Mainin ensimmäisen vanhemman ketjun jokainen uusi commit on GitHubin luoma (committer
-   web-flow ja varmennettu allekirjoitus). Ehto 1 ei yksin riitä: GitHub merkitsee PR:n
-   yhdistetyksi myös, kun sen haara pushataan suoraan mainiin (epäsuora yhdistäminen).
+1. Jokaisella pushin commitilla on PR-kytkentä
+   (GET /repos/{owner}/{repo}/commits/{sha}/pulls) PR:ään, joka on yhdistetty
+   (merged_at) ja jonka kohde on main.
+2. Mainin ensimmäisen vanhemman ketjun jokainen uusi commit on GitHubin luoma
+   (committer web-flow ja varmennettu allekirjoitus). Ehto 1 ei yksin riitä: GitHub
+   merkitsee PR:n yhdistetyksi myös, kun sen haara pushataan suoraan mainiin.
+
+Vertailupohja on edellisen vahtiajon tarkistama kärki, joten ohitettu tai peruttu
+ajo ([skip ci]) ei jätä aukkoa, ja historian muutos ajojen välissä hälyttää.
 """
 
 from __future__ import annotations
@@ -38,8 +42,8 @@ PAGE_SIZE = 100
 MAX_COMMITS = 500
 MAX_ISSUE_PAGES = 10
 # Kytkentä voi näkyä rajapinnassa vasta hetken yhdistämisen jälkeen, joten puuttuvat
-# tarkistetaan uudelleen. Uusinta tehdään vain, kun kärki on GitHubin luoma yhdistäminen:
-# muuten push on joka tapauksessa hälytys, eikä odottaminen muuta tulosta.
+# tarkistetaan uudelleen. Uusinta tehdään vain, kun kärki on GitHubin luoma
+# yhdistäminen: muuten push on joka tapauksessa hälytys.
 RETRY_DELAYS = (10, 20, 30, 60)
 RETRY_LIMIT = 100
 MAX_RATE_WAIT = 60
@@ -50,7 +54,7 @@ Sleep = Callable[[float], None]
 
 
 class ApiError(Exception):
-    """GitHubin rajapintakutsu epäonnistui. status 0 = verkko-, aikakatkaisu- tai muotovirhe."""
+    """Rajapintakutsu epäonnistui. status 0 = verkko-, aikakatkaisu- tai muotovirhe."""
 
     def __init__(self, status: int, path: str) -> None:
         super().__init__(f"GitHub API {status or 'verkko- tai muotovirhe'}: {path}")
@@ -76,7 +80,11 @@ class GitHubApi:
     """Pieni REST-asiakas yhteen repoon. Tunnusta ei tulosteta eikä tallenneta."""
 
     def __init__(
-        self, base_url: str, repo: str, credential: str, sleep: Sleep = time.sleep
+        self,
+        base_url: str,
+        repo: str,
+        credential: str,
+        sleep: Sleep = time.sleep,
     ) -> None:
         self._base = f"{base_url.rstrip('/')}/repos/{repo}"
         self._credential = credential
@@ -93,7 +101,8 @@ class GitHubApi:
         if params:
             url += "?" + urllib.parse.urlencode(params)
         data = None if body is None else json.dumps(body).encode("utf-8")
-        # Ohimenevä virhe (verkko, 5xx tai kiintiöraja) uusitaan kahdesti; muut palautetaan heti.
+        # Luku uusitaan kahdesti ohimenevän virheen (verkko, 5xx) jälkeen. Kirjoitusta
+        # ei uusita, koska GitHub on voinut jo luoda issuen; kiintiöraja uusitaan aina.
         delay: float = 0
         status = 0
         for attempt in range(3):
@@ -112,10 +121,12 @@ class GitHubApi:
             except urllib.error.HTTPError as err:
                 status = err.code
                 wait = rate_limit_wait(status, err.headers)
-                if wait is None and status < 500:
+                if wait is None and (status < 500 or method != "GET"):
                     raise ApiError(status, path) from None
                 delay = wait if wait is not None else (2, 5)[min(attempt, 1)]
             except (OSError, http.client.HTTPException):
+                if method != "GET":
+                    raise ApiError(0, path) from None
                 status = 0
                 delay = (2, 5)[min(attempt, 1)]
             else:
@@ -131,6 +142,7 @@ class Result:
     status: str  # ok, skip, violation tai error
     notes: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    incomplete: list[str] = field(default_factory=list)
     commits: list[dict[str, str]] = field(default_factory=list)
     outside: list[dict[str, str]] = field(default_factory=list)
     checked: int = 0
@@ -139,6 +151,14 @@ class Result:
     @property
     def exit_code(self) -> int:
         return {"ok": 0, "skip": 0, "violation": 1}.get(self.status, 2)
+
+    def settle(self) -> Result:
+        """Hälytys voittaa keskeneräisyyden; keskeneräinen ei ole kunnossa."""
+        if self.reasons:
+            self.status = "violation"
+        elif self.incomplete:
+            self.status = "error"
+        return self
 
 
 def is_zero(sha: str) -> bool:
@@ -155,14 +175,17 @@ def merged_main_prs(prs: Any) -> list[int]:
     return sorted(numbers)
 
 
-def compare_commits(api: GitHubApi, base: str, head: str) -> tuple[str, int, list[dict[str, Any]]]:
+def compare_commits(
+    api: GitHubApi,
+    base: str,
+    head: str,
+) -> tuple[str, int, list[dict[str, Any]]]:
     """Lukee vertailun base...head kaikki commitit sivuittain (enintään MAX_COMMITS)."""
     status, total, commits = "", 0, []
     page = 1
     while True:
-        data = api.request(
-            "GET", f"/compare/{base}...{head}", {"per_page": PAGE_SIZE, "page": page}
-        )
+        params = {"per_page": PAGE_SIZE, "page": page}
+        data = api.request("GET", f"/compare/{base}...{head}", params)
         status = str(data.get("status", ""))
         total = int(data.get("total_commits", 0))
         batch = data.get("commits") or []
@@ -172,46 +195,74 @@ def compare_commits(api: GitHubApi, base: str, head: str) -> tuple[str, int, lis
         page += 1
 
 
-def previous_checked_head(api: GitHubApi, run_id: str) -> str:
-    """Edellisen valmistuneen vahtiajon kärki mainissa, tai tyhjä, jos ajoa ei ole."""
-    data = api.request(
-        "GET",
-        f"/actions/workflows/{WORKFLOW_FILE}/runs",
-        {"branch": MAIN_BRANCH, "event": "push", "status": "completed", "per_page": 30},
-    )
-    runs = [
-        run
-        for run in (data or {}).get("workflow_runs") or []
-        if str(run.get("id")) != run_id and run.get("conclusion") in ("success", "failure")
-    ]
-    runs.sort(key=lambda run: int(run.get("run_number") or 0), reverse=True)
-    return str(runs[0].get("head_sha") or "") if runs else ""
+def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
+    """Edellisen valmistuneen vahtiajon kärki mainissa, tai tyhjä, jos ajoa ei ole.
+
+    Vain tätä ajoa aiemmat ajot kelpaavat, jotta vanhan ajon uudelleenajo ei vertaa
+    myöhempään kärkeen.
+    """
+    params = {
+        "branch": MAIN_BRANCH,
+        "event": "push",
+        "status": "completed",
+        "per_page": 30,
+    }
+    data = api.request("GET", f"/actions/workflows/{WORKFLOW_FILE}/runs", params)
+    runs = []
+    for run in (data or {}).get("workflow_runs") or []:
+        number = int(run.get("run_number") or 0)
+        if str(run.get("id")) == run_id:
+            continue
+        if run_number and number >= run_number:
+            continue
+        if run.get("conclusion") in ("success", "failure"):
+            runs.append((number, str(run.get("head_sha") or "")))
+    return max(runs)[1] if runs else ""
 
 
-def choose_base(api: GitHubApi, before: str, run_id: str, notes: list[str]) -> str:
-    """Vertailupohja: edellisen vahtiajon kärki, jos välistä puuttuu ajo; muuten before.
+def choose_base(
+    api: GitHubApi,
+    before: str,
+    run_id: str,
+    run_number: int,
+    result: Result,
+) -> str:
+    """Vertailupohja: edellisen vahtiajon kärki, jos välistä puuttuu ajo.
 
-    Push, jonka työnkulku ohitettiin ([skip ci]) tai jonka ajo peruttiin, tarkistetaan näin
-    seuraavassa ajossa.
+    Push, jonka työnkulku ohitettiin ([skip ci]) tai jonka ajo peruttiin,
+    tarkistetaan näin seuraavassa ajossa. Jos edellinen kärki ei ole before-arvon
+    esivanhempi, mainin historia muuttui ajojen välissä, ja se on hälytys.
     """
     try:
-        previous = previous_checked_head(api, run_id)
-        if not previous or previous == before or not SHA_RE.fullmatch(previous):
-            return before
-        status = str(api.request("GET", f"/compare/{previous}...{before}").get("status", ""))
+        previous = previous_checked_head(api, run_id, run_number)
     except ApiError as err:
-        notes.append(f"Edellisten vahtiajojen luku epäonnistui ({err}); vertailupohja on before.")
+        result.incomplete.append(
+            f"Edellisten vahtiajojen luku epäonnistui ({err}), joten väliä edelliseen "
+            "tarkistukseen ei todennettu."
+        )
         return before
+    if not previous or previous == before or not SHA_RE.fullmatch(previous):
+        return before
+    try:
+        data = api.request("GET", f"/compare/{previous}...{before}")
+        status = str((data or {}).get("status", ""))
+    except ApiError as err:
+        if err.status not in (404, 422):
+            msg = f"Edellisen tarkistetun kärjen vertailu epäonnistui: {err}"
+            result.incomplete.append(msg)
+            return before
+        status = "kärki puuttuu"
     if status == "ahead":
-        notes.append(
+        result.notes.append(
             f"Edellinen vahtiajo tarkisti kärjen {previous[:12]}. Väli siitä tämän pushin "
-            "before-arvoon jäi ilman vahtiajoa (esim. [skip ci] tai peruttu ajo), joten se "
-            "tarkistetaan nyt."
+            "before-arvoon jäi ilman vahtiajoa (esim. [skip ci] tai peruttu ajo), joten "
+            "se tarkistetaan nyt."
         )
         return previous
-    notes.append(
-        f"Edellisen vahtiajon kärki {previous[:12]} ei ole before-arvon esivanhempi; "
-        "vertailupohja on before."
+    result.reasons.append(
+        f"Mainin historia muuttui edellisen vahtiajon jälkeen: sen tarkistama kärki "
+        f"{previous[:12]} ei ole tämän pushin before-arvon esivanhempi (tila {status}). "
+        "Pakotettu push ohitti vahdin."
     )
     return before
 
@@ -231,7 +282,10 @@ def created_by_github(commit: dict[str, Any]) -> bool:
 
 
 def first_parent_path(
-    api: GitHubApi, commits: list[dict[str, Any]], base: str, after: str
+    api: GitHubApi,
+    commits: list[dict[str, Any]],
+    base: str,
+    after: str,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Ketju after → base ensimmäisiä vanhempia pitkin vertailun commiteista.
 
@@ -250,106 +304,115 @@ def first_parent_path(
     return path, current == base
 
 
+def check_chain_and_prs(
+    api: GitHubApi,
+    sleep: Sleep,
+    delays: tuple[float, ...],
+    commits: list[dict[str, Any]],
+    after: str,
+    forced: bool,
+    result: Result,
+) -> None:
+    path, reaches_base = first_parent_path(api, commits, result.base, after)
+    result.outside = [describe(c) for c in path if not created_by_github(c)]
+    if result.outside:
+        result.reasons.append(
+            f"{len(result.outside)} mainin ensimmäisen vanhemman ketjun commitia ei ole "
+            "GitHubin luoma yhdistäminen (committer ei ole GitHub tai allekirjoitusta ei "
+            "ole varmennettu). PR-haaran suora push merkitsee PR:n yhdistetyksi, mutta "
+            "ohittaa yhdistämisen."
+        )
+    if not reaches_base and not forced:
+        result.reasons.append(
+            "Mainin ensimmäisen vanhemman ketju ei palaa edelliseen kärkeen, joten main "
+            "ei edennyt PR-yhdistämisellä."
+        )
+    merge_like = not result.reasons
+    pending = [c for c in commits if c.get("sha")]
+    result.checked = len(pending)
+    for attempt, delay in enumerate((0, *delays)):
+        if attempt and (not merge_like or len(pending) > RETRY_LIMIT):
+            break
+        if delay:
+            sleep(delay)
+        missing = []
+        for commit in pending:
+            path_pulls = f"/commits/{commit['sha']}/pulls"
+            prs = api.request("GET", path_pulls, {"per_page": PAGE_SIZE})
+            if not merged_main_prs(prs):
+                missing.append(commit)
+        pending = missing
+        if not pending:
+            break
+    if pending:
+        count = len(pending)
+        msg = f"{count} commitilla ei ole yhdistettyä PR:ää (kohde {MAIN_BRANCH})."
+        result.reasons.append(msg)
+        result.commits = [describe(c) for c in pending]
+
+
 def check_push(
     event: dict[str, Any],
     api: GitHubApi,
     sleep: Sleep,
     delays: tuple[float, ...] = RETRY_DELAYS,
     run_id: str = "",
+    run_number: int = 0,
+    checkout_failed: bool = False,
 ) -> Result:
     ref = str(event.get("ref") or "")
     if ref != MAIN_REF:
-        return Result(
-            "skip", notes=[f"Viite {ref or '(puuttuu)'} ei ole {MAIN_REF}; ei tarkistettavaa."]
-        )
+        note = f"Viite {ref or '(puuttuu)'} ei ole {MAIN_REF}; ei tarkistettavaa."
+        return Result("skip", notes=[note])
     before = str(event.get("before") or "")
     after = str(event.get("after") or "")
     if event.get("deleted") or is_zero(after):
-        return Result("skip", notes=["Main poistettiin; tarkistettavia committeja ei ole."])
+        note = "Main poistettiin; tarkistettavia committeja ei ole."
+        return Result("skip", notes=[note])
     if not SHA_RE.fullmatch(after):
-        return Result("error", notes=["Tapahtuman after-arvo ei ole commit-tunniste."])
+        note = "Tapahtuman after-arvo ei ole commit-tunniste."
+        return Result("error", incomplete=[note])
     if event.get("created") or is_zero(before):
-        return Result(
-            "skip",
-            notes=[
-                "Main luotiin tässä pushissa (esimerkiksi uuden repon ensimmäinen push), "
-                "joten vertailupohjaa ei ole. Seuraavat pushit tarkistetaan."
-            ],
+        note = (
+            "Main luotiin tässä pushissa (esimerkiksi uuden repon ensimmäinen push), "
+            "joten vertailupohjaa ei ole. Seuraavat pushit tarkistetaan."
         )
+        return Result("skip", notes=[note])
     if not SHA_RE.fullmatch(before):
-        return Result("error", notes=["Tapahtuman before-arvo ei ole commit-tunniste."])
+        note = "Tapahtuman before-arvo ei ole commit-tunniste."
+        return Result("error", incomplete=[note])
 
     result = Result("ok")
+    if checkout_failed:
+        result.incomplete.append(
+            "Vahdin skriptin haku mainin edellisestä kärjestä epäonnistui, joten ajettiin "
+            "pushattu versio."
+        )
     forced = bool(event.get("forced"))
     if forced:
-        result.reasons.append("Pakotettu push: mainin historia kirjoitettiin uudelleen.")
-    base = before if forced else choose_base(api, before, run_id, result.notes)
-    result.base = base
+        note = "Pakotettu push: mainin historia kirjoitettiin uudelleen."
+        result.reasons.append(note)
+        result.base = before
+    else:
+        result.base = choose_base(api, before, run_id, run_number, result)
     try:
-        status, total, commits = compare_commits(api, base, after)
+        status, total, commits = compare_commits(api, result.base, after)
     except ApiError as err:
-        if result.reasons:
-            result.status = "violation"
-            result.notes.append(f"Vertailu epäonnistui ({err}); committeja ei tarkistettu.")
-            return result
-        result.status = "error"
-        result.notes.append(f"Vertailu epäonnistui: {err}")
-        return result
+        msg = f"Vertailu epäonnistui, committeja ei tarkistettu: {err}"
+        result.incomplete.append(msg)
+        return result.settle()
     if status not in ("ahead", "identical") and not forced:
-        result.reasons.append(f"Vertailun tila on {status}: main ei edennyt suoraan eteenpäin.")
+        msg = f"Vertailun tila on {status}: main ei edennyt suoraan eteenpäin."
+        result.reasons.append(msg)
     if total > MAX_COMMITS:
-        result.reasons.append(
-            f"Pushissa on {total} committia, yli tarkistusrajan {MAX_COMMITS}. Tarkista käsin."
-        )
-        result.status = "violation"
-        return result
-
+        msg = f"Pushissa on {total} committia, yli rajan {MAX_COMMITS}: tarkista käsin."
+        result.reasons.append(msg)
+        return result.settle()
     try:
-        path, reaches_base = first_parent_path(api, commits, base, after)
-        result.outside = [describe(c) for c in path if not created_by_github(c)]
-        if result.outside:
-            result.reasons.append(
-                f"{len(result.outside)} mainin ensimmäisen vanhemman ketjun commitia ei ole "
-                "GitHubin luoma yhdistäminen (committer ei ole GitHub tai allekirjoitusta ei "
-                "ole varmennettu). PR-haaran suora push merkitsee PR:n yhdistetyksi, mutta "
-                "ohittaa yhdistämisen."
-            )
-        if not reaches_base and not forced:
-            result.reasons.append(
-                "Mainin ensimmäisen vanhemman ketju ei palaa edelliseen kärkeen, joten main ei "
-                "edennyt PR-yhdistämisellä."
-            )
-        merge_like = not result.reasons
-
-        pending = [c for c in commits if c.get("sha")]
-        result.checked = len(pending)
-        for attempt, delay in enumerate((0, *delays)):
-            if attempt and (not merge_like or len(pending) > RETRY_LIMIT):
-                break
-            if delay:
-                sleep(delay)
-            missing = []
-            for commit in pending:
-                prs = api.request("GET", f"/commits/{commit['sha']}/pulls", {"per_page": PAGE_SIZE})
-                if not merged_main_prs(prs):
-                    missing.append(commit)
-            pending = missing
-            if not pending:
-                break
+        check_chain_and_prs(api, sleep, delays, commits, after, forced, result)
     except ApiError as err:
-        # Jo todettu syy (esim. pakotettu push) hälyttää, vaikka loppu jäi tarkistamatta.
-        result.status = "violation" if result.reasons else "error"
-        result.notes.append(f"Ketjun tai PR-kytkennän luku epäonnistui: {err}")
-        return result
-
-    if pending:
-        result.reasons.append(
-            f"{len(pending)} commitilla ei ole yhdistettyä PR:ää, jonka kohde on {MAIN_BRANCH}."
-        )
-        result.commits = [describe(c) for c in pending]
-    if result.reasons:
-        result.status = "violation"
-    return result
+        result.incomplete.append(f"Ketjun tai PR-kytkennän luku epäonnistui: {err}")
+    return result.settle()
 
 
 def code_span(text: str, limit: int = 100) -> str:
@@ -365,10 +428,10 @@ def commit_lines(heading: str, commits: list[dict[str, str]]) -> list[str]:
         return []
     lines = ["", heading]
     for commit in commits[:LISTED_COMMITS]:
-        lines.append(
-            f"- {code_span(commit['sha'][:12])} {code_span(commit['title'])} "
-            f"({code_span(commit['author'], 60)})"
-        )
+        sha = code_span(commit["sha"][:12])
+        title = code_span(commit["title"])
+        author = code_span(commit["author"], 60)
+        lines.append(f"- {sha} {title} ({author})")
     if len(commits) > LISTED_COMMITS:
         lines.append(f"- … ja {len(commits) - LISTED_COMMITS} muuta (ks. ajo).")
     return lines
@@ -380,13 +443,13 @@ def report_body(event: dict[str, Any], result: Result, repo: str, run_url: str) 
     pusher = str((event.get("pusher") or {}).get("name") or "")
     if result.status == "violation":
         intro = (
-            "Main-push-vahti havaitsi mainissa muutoksen, joka ei tullut yhdistetyn pull "
-            "requestin kautta."
+            "Main-push-vahti havaitsi mainissa muutoksen, joka ei tullut yhdistetyn "
+            "pull requestin kautta."
         )
     else:
         intro = (
-            "Main-push-vahdin tarkistus ei valmistunut, joten tätä pushia ei ole todennettu. "
-            "Tarkista se käsin ja aja vahti uudelleen."
+            "Main-push-vahdin tarkistus ei valmistunut, joten tätä pushia ei ole "
+            "todennettu. Tarkista se käsin ja aja vahti uudelleen."
         )
     lines = [
         intro,
@@ -401,39 +464,41 @@ def report_body(event: dict[str, Any], result: Result, repo: str, run_url: str) 
     compare_url = str(event.get("compare") or "")
     if compare_url.startswith("https://"):
         lines.append(f"- Vertailu: {compare_url}")
-    lines += ["", "Syyt:"] + [f"- {text}" for text in result.reasons + result.notes]
-    lines += commit_lines("Mainin ketjun commitit, joita GitHub ei luonut:", result.outside)
-    lines += commit_lines(
-        f"Commitit ilman yhdistettyä PR:ää (kohde {MAIN_BRANCH}):", result.commits
-    )
+    texts = result.reasons + result.incomplete + result.notes
+    lines += ["", "Syyt:"] + [f"- {text}" for text in texts]
+    heading = "Mainin ketjun commitit, joita GitHub ei luonut:"
+    lines += commit_lines(heading, result.outside)
+    heading = f"Commitit ilman yhdistettyä PR:ää (kohde {MAIN_BRANCH}):"
+    lines += commit_lines(heading, result.commits)
     lines += [
         "",
-        "Selvitä, kuka pushasi ja miksi. Palauta muutos tarvittaessa revert-PR:llä ja sulje tämä "
-        "issue, kun asia on käsitelty. Uudet havainnot lisätään tähän kommentteina, kunnes issue "
-        "suljetaan.",
+        (
+            "Selvitä, kuka pushasi ja miksi. Palauta muutos tarvittaessa revert-PR:llä "
+            "ja sulje tämä issue, kun asia on käsitelty. Uudet havainnot lisätään tähän "
+            "kommentteina, kunnes issue suljetaan."
+        ),
     ]
     return "\n".join(lines) + "\n"
 
 
 def report_issue(api: GitHubApi, body: str) -> str:
-    """Kommentoi vahdin avointa issueta tai avaa uuden. Yksi avoin issue kerrallaan.
+    """Kommentoi vahdin avointa issueta tai avaa uuden. Yksi avoin kerrallaan.
 
-    Vain vahdin (github-actions[bot]) avaamat issuet kelpaavat, jotta kuka tahansa ei voi
-    ohjata hälytyksiä omaan samannimiseen issueensa.
+    Vain vahdin (github-actions[bot]) avaamat issuet kelpaavat, jotta kuka tahansa ei
+    voi ohjata hälytyksiä omaan samannimiseen issueensa.
     """
     existing: list[int] = []
     for page in range(1, MAX_ISSUE_PAGES + 1):
-        issues = api.request(
-            "GET", "/issues", {"state": "open", "per_page": PAGE_SIZE, "page": page}
-        )
-        for issue in issues or []:
+        params = {"state": "open", "per_page": PAGE_SIZE, "page": page}
+        issues = api.request("GET", "/issues", params) or []
+        for issue in issues:
             if (
                 issue.get("title") == ISSUE_TITLE
                 and not issue.get("pull_request")
                 and (issue.get("user") or {}).get("login") == BOT_LOGIN
             ):
                 existing.append(int(issue["number"]))
-        if len(issues or []) < PAGE_SIZE:
+        if len(issues) < PAGE_SIZE:
             break
     if existing:
         number = min(existing)
@@ -445,14 +510,20 @@ def report_issue(api: GitHubApi, body: str) -> str:
 
 def summary_text(result: Result, extra: list[str]) -> str:
     heading = {
-        "ok": "Kunnossa: jokainen commit tuli yhdistetyn PR:n kautta, jonka kohde on main.",
+        "ok": "Kunnossa: jokainen commit tuli yhdistetyn PR:n kautta (kohde main).",
         "skip": "Ei tarkistettavaa.",
         "violation": "HÄLYTYS: suora push mainiin.",
     }.get(result.status, "Tarkistus ei valmistunut.")
-    lines = [f"## Main-push-vahti: {heading}", "", f"Tarkistettuja committeja: {result.checked}"]
-    lines += [f"- {text}" for text in result.reasons + result.notes + extra]
+    lines = [
+        f"## Main-push-vahti: {heading}",
+        "",
+        f"Tarkistettuja committeja: {result.checked}",
+    ]
+    texts = result.reasons + result.incomplete + result.notes + extra
+    lines += [f"- {text}" for text in texts]
     for commit in (result.outside + result.commits)[:LISTED_COMMITS]:
-        lines.append(f"- {code_span(commit['sha'][:12])} {code_span(commit['title'])}")
+        sha = code_span(commit["sha"][:12])
+        lines.append(f"- {sha} {code_span(commit['title'])}")
     return "\n".join(lines) + "\n"
 
 
@@ -465,22 +536,29 @@ def run(
     summary_path: str | None = None,
     delays: tuple[float, ...] = RETRY_DELAYS,
     run_id: str = "",
+    run_number: int = 0,
+    checkout_failed: bool = False,
 ) -> int:
-    result = check_push(event, api, sleep, delays, run_id)
+    result = check_push(event, api, sleep, delays, run_id, run_number, checkout_failed)
     extra: list[str] = []
-    if result.status in ("violation", "error") and str(event.get("ref") or "") == MAIN_REF:
+    on_main = str(event.get("ref") or "") == MAIN_REF
+    if result.status in ("violation", "error") and on_main:
         try:
             extra.append(report_issue(api, report_body(event, result, repo, run_url)))
         except ApiError as err:
             extra.append(f"Issuen avaus tai päivitys epäonnistui: {err}")
-    # Jokainen rivi alkaa omalla etuliitteellä, joten commit-otsikko ei voi olla työnkulkukomento.
-    print(f"main-push-vahti: {result.status}, tarkistettuja committeja {result.checked}")
-    for text in result.reasons + result.notes + extra:
-        print(f"main-push-vahti: {text}")
+    # Jokainen rivi alkaa omalla etuliitteellä, joten commit-otsikko ei voi olla
+    # työnkulkukomento.
+    prefix = "main-push-vahti:"
+    print(f"{prefix} {result.status}, tarkistettuja committeja {result.checked}")
+    for text in result.reasons + result.incomplete + result.notes + extra:
+        print(f"{prefix} {text}")
     for commit in result.outside:
-        print(f"main-push-vahti: ei GitHubin luoma {commit['sha'][:12]} {commit['title'][:100]}")
+        sha, title = commit["sha"][:12], commit["title"][:100]
+        print(f"{prefix} ei GitHubin luoma {sha} {title}")
     for commit in result.commits:
-        print(f"main-push-vahti: ilman PR:ää {commit['sha'][:12]} {commit['title'][:100]}")
+        sha, title = commit["sha"][:12], commit["title"][:100]
+        print(f"{prefix} ilman PR:ää {sha} {title}")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as fh:
             fh.write(summary_text(result, extra))
@@ -492,20 +570,36 @@ def main() -> int:
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     credential = os.environ.get("GITHUB_TOKEN", "")
     if not (event_path and repo and credential):
-        print("main-push-vahti: GITHUB_EVENT_PATH, GITHUB_REPOSITORY tai GITHUB_TOKEN puuttuu")
+        missing = "GITHUB_EVENT_PATH, GITHUB_REPOSITORY tai GITHUB_TOKEN"
+        print(f"main-push-vahti: {missing} puuttuu")
         return 2
+    # Odottamaton virhe ei saa näyttää hälytykseltä (paluukoodi 1), joten se on 2.
     try:
         with open(event_path, encoding="utf-8") as fh:
             event = json.load(fh)
         server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
         run_id = os.environ.get("GITHUB_RUN_ID", "")
+        run_number = int(os.environ.get("GITHUB_RUN_NUMBER") or 0)
         run_url = f"{server}/{repo}/actions/runs/{run_id}"
         api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
         api = GitHubApi(api_url, repo, credential)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
-        return run(event, api, time.sleep, repo, run_url, summary, RETRY_DELAYS, run_id)
-    except Exception as err:  # Odottamaton virhe ei saa näyttää hälytykseltä (paluukoodi 1).
-        print(f"main-push-vahti: odottamaton virhe {type(err).__name__}; tarkistus ei valmistunut")
+        checkout_failed = os.environ.get("VAHTI_EDELLINEN_CHECKOUT") == "failure"
+        return run(
+            event,
+            api,
+            time.sleep,
+            repo,
+            run_url,
+            summary,
+            RETRY_DELAYS,
+            run_id,
+            run_number,
+            checkout_failed,
+        )
+    except Exception as err:  # noqa: BLE001
+        name = type(err).__name__
+        print(f"main-push-vahti: odottamaton virhe {name}; tarkistus ei valmistunut")
         return 2
 
 

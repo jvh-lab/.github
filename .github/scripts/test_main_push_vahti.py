@@ -17,7 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
-SPEC = importlib.util.spec_from_file_location("main_push_vahti", HERE / "main_push_vahti.py")
+SCRIPT = HERE / "main_push_vahti.py"
+SPEC = importlib.util.spec_from_file_location("main_push_vahti", SCRIPT)
 vahti = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = vahti
 SPEC.loader.exec_module(vahti)
@@ -78,9 +79,18 @@ def merge_push(pr_number=5, pr_commits=2):
     for n in range(2, 2 + pr_commits):
         commits.append(commit(n, [parent]))
         parent = sha(n)
-    merge = commit(1, [BEFORE, parent], github=True, title=f"Merge pull request #{pr_number}")
-    commits.append(merge)
+    title = f"Merge pull request #{pr_number}"
+    commits.append(commit(1, [BEFORE, parent], github=True, title=title))
     return commits, {c["sha"]: [pr(pr_number)] for c in commits}
+
+
+def run_entry(run_id, number, head, conclusion="success"):
+    return {
+        "id": run_id,
+        "run_number": number,
+        "conclusion": conclusion,
+        "head_sha": head,
+    }
 
 
 class FakeApi:
@@ -122,7 +132,8 @@ class FakeApi:
                 return {"status": self.prev_status}
             page, size = params["page"], params["per_page"]
             chunk = self.commits[(page - 1) * size : page * size]
-            return {"status": self.status, "total_commits": len(self.commits), "commits": chunk}
+            total = len(self.commits)
+            return {"status": self.status, "total_commits": total, "commits": chunk}
         if path.startswith("/commits/") and path.endswith("/pulls"):
             answer = self.pulls.get(path.split("/")[2], [])
             return answer() if callable(answer) else answer
@@ -151,15 +162,27 @@ class Recorder:
         self.delays.append(delay)
 
 
-def run_check(api, ev=None, delays=(1, 2), run_id="77"):
+def run_check(api, ev=None, delays=(1, 2), run_number=10, checkout_failed=False):
     sleep = Recorder()
     with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-        code = vahti.run(ev or event(), api, sleep, REPO, RUN_URL, None, delays, run_id)
+        code = vahti.run(
+            ev or event(),
+            api,
+            sleep,
+            REPO,
+            RUN_URL,
+            None,
+            delays,
+            "77",
+            run_number,
+            checkout_failed,
+        )
     return code, sleep, out.getvalue()
 
 
 def bot_issue(number, title="Suora push mainiin", **extra):
-    return {"number": number, "title": title, "user": {"login": "github-actions[bot]"}, **extra}
+    user = {"login": "github-actions[bot]"}
+    return {"number": number, "title": title, "user": user, **extra}
 
 
 class AcceptedPushes(unittest.TestCase):
@@ -174,22 +197,13 @@ class AcceptedPushes(unittest.TestCase):
         self.assertIn("main-push-vahti: ok, tarkistettuja committeja 3", out)
 
     def test_squash_commit(self):
-        api = FakeApi(
-            [commit(1, [BEFORE], github=True, title="Ominaisuus (#7)")], {sha(1): [pr(7)]}
-        )
-        self.assertEqual(run_check(api)[0], 0)
-
-    def test_rebase_merged_commits(self):
-        commits = [
-            commit(3, [BEFORE], github=True),
-            commit(2, [sha(3)], github=True),
-            commit(1, [sha(2)], github=True),
-        ]
-        api = FakeApi(commits, {c["sha"]: [pr(8)] for c in commits})
+        squash = commit(1, [BEFORE], github=True, title="Ominaisuus (#7)")
+        api = FakeApi([squash], {sha(1): [pr(7)]})
         self.assertEqual(run_check(api)[0], 0)
 
     def test_commit_with_open_and_merged_pr(self):
-        api = FakeApi([commit(1, [BEFORE], github=True)], {sha(1): [pr(3, merged=False), pr(4)]})
+        merged = commit(1, [BEFORE], github=True)
+        api = FakeApi([merged], {sha(1): [pr(3, merged=False), pr(4)]})
         self.assertEqual(run_check(api)[0], 0)
 
     def test_delayed_association_is_retried(self):
@@ -200,7 +214,8 @@ class AcceptedPushes(unittest.TestCase):
         code, sleep, _ = run_check(api)
         self.assertEqual(code, 0)
         self.assertEqual(sleep.delays, [1])
-        self.assertEqual(api.paths("/commits/").count(f"/commits/{sha(2)}/pulls"), 1)
+        calls = api.paths("/commits/")
+        self.assertEqual(calls.count(f"/commits/{sha(2)}/pulls"), 1)
 
     def test_compare_is_paginated(self):
         commits, pulls = merge_push(pr_commits=149)
@@ -212,19 +227,25 @@ class AcceptedPushes(unittest.TestCase):
 
     def test_missing_verification_is_fetched(self):
         merge = commit(1, [BEFORE], github=True)
-        light = {
-            **merge,
-            "commit": {k: v for k, v in merge["commit"].items() if k != "verification"},
-        }
+        info = {k: v for k, v in merge["commit"].items() if k != "verification"}
+        light = {**merge, "commit": info}
         api = FakeApi([light], {sha(1): [pr(9)]}, full={sha(1): merge})
         self.assertEqual(run_check(api)[0], 0)
         self.assertIn(f"/commits/{sha(1)}", api.paths("/commits/"))
 
     def test_previous_run_at_before_keeps_base(self):
         commits, pulls = merge_push()
-        runs = [{"id": 5, "run_number": 5, "conclusion": "success", "head_sha": BEFORE}]
-        api = FakeApi(commits, pulls, runs=runs)
+        api = FakeApi(commits, pulls, runs=[run_entry(5, 5, BEFORE)])
         self.assertEqual(run_check(api)[0], 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
+    def test_rerun_of_older_run_ignores_newer_runs(self):
+        # Vanhan ajon uudelleenajo: uudemmat ajot (run_number >= oma) eivät ole pohja.
+        commits, pulls = merge_push()
+        runs = [run_entry(9, 9, PREV), run_entry(4, 4, BEFORE)]
+        api = FakeApi(commits, pulls, runs=runs, prev_status="behind")
+        code, _, _ = run_check(api, run_number=5)
+        self.assertEqual(code, 0)
         self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
 
 
@@ -254,7 +275,8 @@ class Skipped(unittest.TestCase):
 
 class DirectPushes(unittest.TestCase):
     def test_direct_push_opens_issue(self):
-        api = FakeApi([commit(1, [BEFORE], title="korjaus suoraan mainiin")], {sha(1): []})
+        direct = commit(1, [BEFORE], title="korjaus suoraan mainiin")
+        api = FakeApi([direct], {sha(1): []})
         code, sleep, out = run_check(api)
         self.assertEqual(code, 1)
         self.assertEqual(len(api.created), 1)
@@ -267,7 +289,7 @@ class DirectPushes(unittest.TestCase):
         self.assertIn("Avattu issue #99", out)
 
     def test_pr_branch_pushed_to_main_is_indirect_merge(self):
-        # GitHub merkitsee PR:n yhdistetyksi, kun sen commitit pushataan suoraan mainiin.
+        # GitHub merkitsee PR:n yhdistetyksi, kun sen commitit pushataan mainiin.
         commits = [commit(2, [BEFORE]), commit(1, [sha(2)])]
         api = FakeApi(commits, {c["sha"]: [pr(42)] for c in commits})
         code, _, _ = run_check(api)
@@ -278,8 +300,8 @@ class DirectPushes(unittest.TestCase):
         self.assertIn(sha(2)[:12], body)
 
     def test_update_branch_commit_pushed_to_main(self):
-        # Update branch -painikkeen merge-commit on GitHubin luoma, mutta ensimmäinen vanhempi
-        # on PR-haara eikä main.
+        # Update branch -painikkeen merge-commit on GitHubin luoma, mutta sen
+        # ensimmäinen vanhempi on PR-haara eikä main.
         commits = [commit(2, [OLD]), commit(1, [sha(2), BEFORE], github=True)]
         api = FakeApi(commits, {c["sha"]: [pr(42)] for c in commits})
         code, _, _ = run_check(api)
@@ -289,13 +311,25 @@ class DirectPushes(unittest.TestCase):
         self.assertIn(sha(2)[:12], body)
 
     def test_local_merge_pushed_to_main(self):
-        commits = [commit(2, [BEFORE]), commit(1, [BEFORE, sha(2)], title="Merge branch 'feat/x'")]
+        local = commit(1, [BEFORE, sha(2)], title="Merge branch 'feat/x'")
+        commits = [commit(2, [BEFORE]), local]
         api = FakeApi(commits, {c["sha"]: [pr(42)] for c in commits})
         self.assertEqual(run_check(api)[0], 1)
 
     def test_forged_committer_without_signature(self):
         forged = commit(1, [BEFORE], github=True, verified=False)
         api = FakeApi([forged], {sha(1): [pr(5)]})
+        self.assertEqual(run_check(api)[0], 1)
+
+    def test_rebase_merge_alarms_because_github_does_not_sign(self):
+        # GitHubin ohje: rebase-yhdistämisen committeja ei allekirjoiteta, joten
+        # vahti ei tue rebase-yhdistämistä (jvh-lab käyttää merge-yhdistämistä).
+        commits = [
+            commit(3, [BEFORE], github=True, verified=False),
+            commit(2, [sha(3)], github=True, verified=False),
+            commit(1, [sha(2)], github=True, verified=False),
+        ]
+        api = FakeApi(commits, {c["sha"]: [pr(8)] for c in commits})
         self.assertEqual(run_check(api)[0], 1)
 
     def test_web_editor_commit_without_pr(self):
@@ -305,15 +339,15 @@ class DirectPushes(unittest.TestCase):
         self.assertIn("ei ole yhdistettyä PR:ää", api.created[0]["body"])
 
     def test_skipped_push_is_checked_on_next_run(self):
-        # [skip ci] -commit X ei käynnistänyt vahtia; seuraava PR-yhdistäminen tarkistaa sen.
+        # [skip ci] -commit X ei käynnistänyt vahtia; seuraava yhdistäminen tarkistaa sen.
         x = commit(20, [PREV], title="korjaus [skip ci]")
         commits, pulls = merge_push()
         commits[0]["parents"] = [{"sha": sha(20)}]
         commits[-1]["parents"][0] = {"sha": sha(20)}
         runs = [
-            {"id": 77, "run_number": 9, "conclusion": None, "head_sha": sha(1)},
-            {"id": 6, "run_number": 6, "conclusion": "success", "head_sha": PREV},
-            {"id": 4, "run_number": 4, "conclusion": "success", "head_sha": OLD},
+            run_entry(77, 9, sha(1), conclusion=None),
+            run_entry(6, 6, PREV),
+            run_entry(4, 4, OLD),
         ]
         api = FakeApi([x, *commits], {**pulls, sha(20): []}, runs=runs)
         code, _, _ = run_check(api, event(before=sha(20)))
@@ -323,21 +357,23 @@ class DirectPushes(unittest.TestCase):
         self.assertIn("korjaus [skip ci]", body)
         self.assertIn("Vertailupohja", body)
 
-    def test_previous_run_not_ancestor_falls_back_to_before(self):
+    def test_history_rewritten_between_runs_alarms(self):
+        # Pakotettu push, jonka vahtiajo ohitettiin tai peruttiin.
         commits, pulls = merge_push()
-        runs = [{"id": 6, "run_number": 6, "conclusion": "failure", "head_sha": PREV}]
+        runs = [run_entry(6, 6, PREV, conclusion="failure")]
         api = FakeApi(commits, pulls, runs=runs, prev_status="diverged")
-        code, _, out = run_check(api)
-        self.assertEqual(code, 0)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 1)
         self.assertIn(f"/compare/{BEFORE}...{sha(1)}", api.paths("/compare/"))
-        self.assertIn("ei ole before-arvon esivanhempi", out)
+        self.assertIn("historia muuttui", api.created[0]["body"])
 
-    def test_runs_api_failure_falls_back_to_before(self):
+    def test_previous_head_missing_alarms(self):
         commits, pulls = merge_push()
-        api = FakeApi(commits, pulls, fail={"/actions/": 403})
-        code, _, out = run_check(api)
-        self.assertEqual(code, 0)
-        self.assertIn("Edellisten vahtiajojen luku epäonnistui", out)
+        runs = [run_entry(6, 6, PREV)]
+        fail = {f"/compare/{PREV}": 404}
+        api = FakeApi(commits, pulls, runs=runs, fail=fail)
+        self.assertEqual(run_check(api)[0], 1)
+        self.assertIn("kärki puuttuu", api.created[0]["body"])
 
     def test_open_issue_is_commented_not_duplicated(self):
         issues = [
@@ -354,7 +390,8 @@ class DirectPushes(unittest.TestCase):
         self.assertIn("issueen #6", out)
 
     def test_decoy_issue_by_other_user_is_ignored(self):
-        decoy = {"number": 3, "title": "Suora push mainiin", "user": {"login": "joku"}}
+        user = {"login": "joku"}
+        decoy = {"number": 3, "title": "Suora push mainiin", "user": user}
         api = FakeApi([commit(1, [BEFORE])], {sha(1): []}, issues=[decoy])
         self.assertEqual(run_check(api)[0], 1)
         self.assertEqual(api.comments, [])
@@ -368,11 +405,13 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual([c[0] for c in api.comments], ["/issues/150/comments"])
 
     def test_only_open_pr_is_not_enough(self):
-        api = FakeApi([commit(1, [BEFORE], github=True)], {sha(1): [pr(3, merged=False)]})
+        merged = commit(1, [BEFORE], github=True)
+        api = FakeApi([merged], {sha(1): [pr(3, merged=False)]})
         self.assertEqual(run_check(api)[0], 1)
 
     def test_pr_merged_into_other_branch_is_not_enough(self):
-        api = FakeApi([commit(1, [BEFORE], github=True)], {sha(1): [pr(3, base="develop")]})
+        merged = commit(1, [BEFORE], github=True)
+        api = FakeApi([merged], {sha(1): [pr(3, base="develop")]})
         self.assertEqual(run_check(api)[0], 1)
 
     def test_one_direct_commit_among_pr_commits(self):
@@ -391,7 +430,7 @@ class DirectPushes(unittest.TestCase):
         code, _, _ = run_check(api, event(forced=True))
         self.assertEqual(code, 1)
         self.assertIn("Pakotettu push", api.created[0]["body"])
-        self.assertEqual(api.paths("/actions/"), [], "pakotetussa pushissa pohja on before")
+        self.assertEqual(api.paths("/actions/"), [], "pakotetussa pohja on before")
 
     def test_forced_reset_to_older_commit(self):
         api = FakeApi([], status="behind")
@@ -409,9 +448,9 @@ class DirectPushes(unittest.TestCase):
         code, _, _ = run_check(api)
         self.assertEqual(code, 1)
         self.assertEqual(api.paths("/commits/"), [])
-        self.assertIn("yli tarkistusrajan", api.created[0]["body"])
+        self.assertIn("yli rajan", api.created[0]["body"])
 
-    def test_large_merge_with_delayed_association_is_retried_up_to_limit(self):
+    def test_large_merge_with_missing_association_is_not_retried(self):
         commits, pulls = merge_push(pr_commits=vahti.RETRY_LIMIT + 1)
         for c in commits:
             pulls[c["sha"]] = []
@@ -421,21 +460,24 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(sleep.delays, [], "yli rajan ei uusita")
 
     def test_issue_failure_still_fails_the_run(self):
-        api = FakeApi([commit(1, [BEFORE])], {sha(1): []}, fail={"/issues": 410})
+        fail = {"/issues": 410}
+        api = FakeApi([commit(1, [BEFORE])], {sha(1): []}, fail=fail)
         code, _, out = run_check(api)
         self.assertEqual(code, 1)
         self.assertIn("Issuen avaus tai päivitys epäonnistui", out)
 
     def test_untrusted_text_cannot_mention_or_inject(self):
         title = "::error::huijaus @juha `x` " + "a" * 200
-        api = FakeApi([commit(1, [BEFORE], title=title, author="@toinen")], {sha(1): []})
+        direct = commit(1, [BEFORE], title=title, author="@toinen")
+        api = FakeApi([direct], {sha(1): []})
         code, _, out = run_check(api)
         self.assertEqual(code, 1)
         body = api.created[0]["body"]
         outside_code = re.sub(r"`[^`]*`", "", body)
         self.assertNotIn("@", outside_code)
         self.assertNotIn("::error::", outside_code)
-        self.assertTrue(all(line.startswith("main-push-vahti: ") for line in out.splitlines()))
+        lines = out.splitlines()
+        self.assertTrue(all(line.startswith("main-push-vahti: ") for line in lines))
 
 
 class Errors(unittest.TestCase):
@@ -453,7 +495,7 @@ class Errors(unittest.TestCase):
         self.assertEqual(len(api.created), 1)
 
     def test_association_failure_is_error_and_reported(self):
-        commits, pulls = merge_push()
+        commits, _ = merge_push()
         api = FakeApi(commits, fail={"/commits/": 500})
         code, _, _ = run_check(api)
         self.assertEqual(code, 2)
@@ -463,6 +505,22 @@ class Errors(unittest.TestCase):
         api = FakeApi([commit(1, [BEFORE])], fail={"/commits/": 500})
         self.assertEqual(run_check(api)[0], 1)
 
+    def test_runs_api_failure_is_reported_but_push_is_checked(self):
+        commits, pulls = merge_push()
+        api = FakeApi(commits, pulls, fail={"/actions/": 403})
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 2)
+        self.assertEqual(len(api.paths("/commits/")), 3)
+        body = api.created[0]["body"]
+        self.assertIn("Edellisten vahtiajojen luku epäonnistui", body)
+
+    def test_previous_checkout_failure_is_reported(self):
+        commits, pulls = merge_push()
+        api = FakeApi(commits, pulls)
+        code, _, _ = run_check(api, checkout_failed=True)
+        self.assertEqual(code, 2)
+        self.assertIn("pushattu versio", api.created[0]["body"])
+
     def test_invalid_sha_is_error(self):
         api = FakeApi()
         self.assertEqual(run_check(api, event(after="main"))[0], 2)
@@ -471,19 +529,27 @@ class Errors(unittest.TestCase):
         self.assertEqual(api.paths("/compare/"), [])
 
     def test_main_requires_environment(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            with mock.patch("sys.stdout", new_callable=io.StringIO):
-                self.assertEqual(vahti.main(), 2)
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            self.assertEqual(vahti.main(), 2)
 
     def test_unexpected_exception_is_not_an_alarm(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "event.json"
             path.write_text(json.dumps(event()), encoding="utf-8")
-            env = {"GITHUB_EVENT_PATH": str(path), "GITHUB_REPOSITORY": REPO, "GITHUB_TOKEN": "x"}
-            with mock.patch.dict(os.environ, env, clear=True):
-                with mock.patch.object(vahti, "run", side_effect=KeyError("number")):
-                    with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-                        self.assertEqual(vahti.main(), 2)
+            env = {
+                "GITHUB_EVENT_PATH": str(path),
+                "GITHUB_REPOSITORY": REPO,
+                "GITHUB_TOKEN": "x",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(vahti, "run", side_effect=KeyError("number")),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+            ):
+                self.assertEqual(vahti.main(), 2)
         self.assertIn("odottamaton virhe KeyError", out.getvalue())
 
     def test_summary_is_written(self):
@@ -523,15 +589,13 @@ class RealClient(unittest.TestCase):
             seen.append((req, timeout))
             return FakeResponse(json.dumps([{"number": 1}]).encode())
 
+        path = f"/commits/{sha(1)}/pulls"
         with mock.patch("urllib.request.urlopen", fake_urlopen):
-            data = self.client(Recorder()).request(
-                "GET", f"/commits/{sha(1)}/pulls", {"per_page": 100}
-            )
+            data = self.client(Recorder()).request("GET", path, {"per_page": 100})
         self.assertEqual(data, [{"number": 1}])
         req, timeout = seen[0]
-        self.assertEqual(
-            req.full_url, f"https://api.github.com/repos/{REPO}/commits/{sha(1)}/pulls?per_page=100"
-        )
+        url = f"https://api.github.com/repos/{REPO}{path}?per_page=100"
+        self.assertEqual(req.full_url, url)
         self.assertEqual(req.get_header("X-github-api-version"), vahti.API_VERSION)
         self.assertEqual(req.get_header("Authorization"), "Bearer kokeilu")
         self.assertEqual(timeout, 30)
@@ -542,23 +606,43 @@ class RealClient(unittest.TestCase):
         def fail(req, timeout):
             raise http_error(req, 404)
 
-        with mock.patch("urllib.request.urlopen", fail):
-            with self.assertRaises(vahti.ApiError) as ctx:
-                self.client(sleep).request("GET", "/compare/a...b")
+        with (
+            mock.patch("urllib.request.urlopen", fail),
+            self.assertRaises(vahti.ApiError) as ctx,
+        ):
+            self.client(sleep).request("GET", "/compare/a...b")
         self.assertEqual(ctx.exception.status, 404)
         self.assertEqual(sleep.delays, [])
 
-    def test_network_error_is_retried_then_raised(self):
+    def test_network_error_on_read_is_retried_then_raised(self):
         sleep = Recorder()
 
         def fail(req, timeout):
             raise urllib.error.URLError("katkos")
 
-        with mock.patch("urllib.request.urlopen", fail):
-            with self.assertRaises(vahti.ApiError) as ctx:
-                self.client(sleep).request("POST", "/issues", body={"title": "x"})
+        with (
+            mock.patch("urllib.request.urlopen", fail),
+            self.assertRaises(vahti.ApiError) as ctx,
+        ):
+            self.client(sleep).request("GET", "/issues")
         self.assertEqual(ctx.exception.status, 0)
         self.assertEqual(sleep.delays, [2, 5])
+
+    def test_write_is_not_retried_after_network_error(self):
+        sleep = Recorder()
+        calls = []
+
+        def fail(req, timeout):
+            calls.append(req)
+            raise urllib.error.URLError("katkos")
+
+        with (
+            mock.patch("urllib.request.urlopen", fail),
+            self.assertRaises(vahti.ApiError),
+        ):
+            self.client(sleep).request("POST", "/issues", body={"title": "x"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sleep.delays, [])
 
     def test_rate_limit_waits_retry_after(self):
         sleep = Recorder()
@@ -579,15 +663,22 @@ class RealClient(unittest.TestCase):
         def fail(req, timeout):
             raise http_error(req, 403, {"X-RateLimit-Remaining": "4999"})
 
-        with mock.patch("urllib.request.urlopen", fail):
-            with self.assertRaises(vahti.ApiError):
-                self.client(sleep).request("GET", "/issues")
+        with (
+            mock.patch("urllib.request.urlopen", fail),
+            self.assertRaises(vahti.ApiError),
+        ):
+            self.client(sleep).request("GET", "/issues")
         self.assertEqual(sleep.delays, [])
 
     def test_non_json_body_is_api_error(self):
-        with mock.patch("urllib.request.urlopen", lambda req, timeout: FakeResponse(b"<html>")):
-            with self.assertRaises(vahti.ApiError) as ctx:
-                self.client(Recorder()).request("GET", "/issues")
+        def html(req, timeout):
+            return FakeResponse(b"<html>")
+
+        with (
+            mock.patch("urllib.request.urlopen", html),
+            self.assertRaises(vahti.ApiError) as ctx,
+        ):
+            self.client(Recorder()).request("GET", "/issues")
         self.assertEqual(ctx.exception.status, 0)
 
 
@@ -601,7 +692,8 @@ class WorkflowFile(unittest.TestCase):
         self.assertRegex(self.text, r"(?m)^  push:\n    branches: \[main\]\n")
         self.assertNotRegex(self.text, r"(?m)^\s+tags:")
         self.assertNotIn("self-hosted", self.text)
-        self.assertEqual(re.findall(r"runs-on: (\S+)", self.text), ["ubuntu-latest"] * 2)
+        runners = re.findall(r"runs-on: (\S+)", self.text)
+        self.assertEqual(runners, ["ubuntu-latest"] * 2)
 
     def test_minimal_permissions(self):
         self.assertRegex(self.text, r"(?m)^permissions: \{\}$")
@@ -617,7 +709,10 @@ class WorkflowFile(unittest.TestCase):
 
     def test_script_comes_from_previous_main_with_fallback(self):
         self.assertIn("ref: ${{ github.event.before }}", self.text)
-        self.assertIn("if: hashFiles('.github/scripts/main_push_vahti.py') == ''", self.text)
+        fallback = "if: hashFiles('.github/scripts/main_push_vahti.py') == ''"
+        self.assertIn(fallback, self.text)
+        outcome = "VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}"
+        self.assertIn(outcome, self.text)
 
     def test_actions_are_pinned_to_sha(self):
         uses = re.findall(r"uses: (\S+)", self.text)

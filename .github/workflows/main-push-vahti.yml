@@ -35,7 +35,9 @@ jobs:
     steps:
       # Skripti haetaan mainin edellisestä kärjestä, jotta suora push ei muuta omaa tarkistustaan.
       # Jos sitä ei ole (vahdin ensimmäinen ajo tai main luotiin), käytetään pushattua versiota.
+      # Haun epäonnistuminen raportoidaan (VAHTI_EDELLINEN_CHECKOUT).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: edellinen
         if: github.event.before != '0000000000000000000000000000000000000000'
         continue-on-error: true
         with:
@@ -50,6 +52,7 @@ jobs:
       - name: PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}
         run: python3 .github/scripts/main_push_vahti.py
 
   itsetesti:
