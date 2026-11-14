@@ -1,0 +1,70 @@
+# Main-push-vahti (agent-foundation D023 J2): jokaisen mainiin tulevan commitin on tultava yhdistetyn
+# PR:n kautta. Suora push (myös PR-haaran push mainiin tai pakotettu push) kaataa ajon ja avaa tai
+# kommentoi issueta "Suora push mainiin" (yksi avoin). Jälkitarkistus ei estä pushia. Ajo on GitHubin
+# isännöimällä Linux-koneella, ei omalla ajokoneella. Tiedosto ja .github/scripts/main_push_vahti.py
+# ovat tavulleen samat kaikissa jvh-labin repoissa ja project-templatessa. Itsetesti ajetaan PR:ssä
+# vain, kun vahdin tiedostot muuttuvat.
+name: main-push-vahti
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/main-push-vahti.yml
+      - .github/scripts/main_push_vahti.py
+      - .github/scripts/test_main_push_vahti.py
+
+permissions: {}
+
+concurrency:
+  group: main-push-vahti-${{ github.event_name }}
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  vahti:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+      actions: read
+    steps:
+      # Skripti haetaan mainin edellisestä kärjestä, jotta suora push ei muuta omaa tarkistustaan.
+      # Jos sitä ei ole (vahdin ensimmäinen ajo tai main luotiin), käytetään pushattua versiota.
+      # Haun epäonnistuminen raportoidaan (VAHTI_EDELLINEN_CHECKOUT).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: edellinen
+        if: github.event.before != '0000000000000000000000000000000000000000'
+        continue-on-error: true
+        with:
+          ref: ${{ github.event.before }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: hashFiles('.github/scripts/main_push_vahti.py') == ''
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - name: PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}
+        run: python3 .github/scripts/main_push_vahti.py
+
+  itsetesti:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - name: fixture-testit
+        run: python3 -m unittest discover -s .github/scripts -p test_main_push_vahti.py -v
