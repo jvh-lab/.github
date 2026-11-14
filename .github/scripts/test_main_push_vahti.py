@@ -367,6 +367,26 @@ class DirectPushes(unittest.TestCase):
         self.assertIn(f"/compare/{BEFORE}...{sha(1)}", api.paths("/compare/"))
         self.assertIn("historia muuttui", api.created[0]["body"])
 
+    def test_history_alarm_does_not_list_delayed_merge_as_direct(self):
+        commits, pulls = merge_push()
+        answers = iter([[], [pr(5)]])
+        pulls[sha(1)] = lambda: next(answers)
+        runs = [run_entry(6, 6, PREV)]
+        api = FakeApi(commits, pulls, runs=runs, prev_status="diverged")
+        code, sleep, _ = run_check(api)
+        self.assertEqual(code, 1)
+        self.assertEqual(sleep.delays, [1])
+        body = api.created[0]["body"]
+        self.assertIn("historia muuttui", body)
+        self.assertNotIn("ilman yhdistettyä PR:ää", body)
+
+    def test_previous_run_already_checked_this_head(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(9, 9, sha(1))]
+        api = FakeApi(commits, pulls, runs=runs, prev_status="behind")
+        self.assertEqual(run_check(api)[0], 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
     def test_previous_head_missing_alarms(self):
         commits, pulls = merge_push()
         runs = [run_entry(6, 6, PREV)]
@@ -513,6 +533,14 @@ class Errors(unittest.TestCase):
         self.assertEqual(len(api.paths("/commits/")), 3)
         body = api.created[0]["body"]
         self.assertIn("Edellisten vahtiajojen luku epäonnistui", body)
+
+    def test_previous_compare_validation_error_is_incomplete(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(6, 6, PREV)]
+        fail = {f"/compare/{PREV}": 422}
+        api = FakeApi(commits, pulls, runs=runs, fail=fail)
+        self.assertEqual(run_check(api)[0], 2)
+        self.assertIn("vertailu epäonnistui", api.created[0]["body"])
 
     def test_previous_checkout_failure_is_reported(self):
         commits, pulls = merge_push()

@@ -223,6 +223,7 @@ def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
 def choose_base(
     api: GitHubApi,
     before: str,
+    after: str,
     run_id: str,
     run_number: int,
     result: Result,
@@ -241,13 +242,14 @@ def choose_base(
             "tarkistukseen ei todennettu."
         )
         return before
-    if not previous or previous == before or not SHA_RE.fullmatch(previous):
+    # Sama kärki voi olla jo tarkistettu (before tai tämän pushin after).
+    if previous in ("", before, after) or not SHA_RE.fullmatch(previous):
         return before
     try:
         data = api.request("GET", f"/compare/{previous}...{before}")
         status = str((data or {}).get("status", ""))
     except ApiError as err:
-        if err.status not in (404, 422):
+        if err.status != 404:
             msg = f"Edellisen tarkistetun kärjen vertailu epäonnistui: {err}"
             result.incomplete.append(msg)
             return before
@@ -262,7 +264,7 @@ def choose_base(
     result.reasons.append(
         f"Mainin historia muuttui edellisen vahtiajon jälkeen: sen tarkistama kärki "
         f"{previous[:12]} ei ole tämän pushin before-arvon esivanhempi (tila {status}). "
-        "Pakotettu push ohitti vahdin."
+        "Todennäköisesti pakotettu push ohitti vahdin."
     )
     return before
 
@@ -327,7 +329,8 @@ def check_chain_and_prs(
             "Mainin ensimmäisen vanhemman ketju ei palaa edelliseen kärkeen, joten main "
             "ei edennyt PR-yhdistämisellä."
         )
-    merge_like = not result.reasons
+    # Uusinta, kun tämän pushin ketju on GitHubin yhdistäminen; muut syyt eivät estä.
+    merge_like = not result.outside and reaches_base
     pending = [c for c in commits if c.get("sha")]
     result.checked = len(pending)
     for attempt, delay in enumerate((0, *delays)):
@@ -394,7 +397,7 @@ def check_push(
         result.reasons.append(note)
         result.base = before
     else:
-        result.base = choose_base(api, before, run_id, run_number, result)
+        result.base = choose_base(api, before, after, run_id, run_number, result)
     try:
         status, total, commits = compare_commits(api, result.base, after)
     except ApiError as err:
