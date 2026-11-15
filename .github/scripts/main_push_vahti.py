@@ -11,9 +11,16 @@ Kaksi ehtoa:
 2. Mainin ensimmäisen vanhemman ketjun jokainen uusi commit on GitHubin luoma
    (committer web-flow ja varmennettu allekirjoitus). Ehto 1 ei yksin riitä: GitHub
    merkitsee PR:n yhdistetyksi myös, kun sen haara pushataan suoraan mainiin.
+3. Mainin uusi kärki ei ole minkään siihen kytketyn PR:n oma head-commit. Aito
+   yhdistäminen (merge, squash tai rebase) luo aina uuden commitin, mutta PR-haaran
+   suora push jättää kärjeksi PR:n headin, vaikka sen commitit olisi tehty GitHubin
+   verkkoeditorilla.
 
-Vertailupohja on edellisen vahtiajon tarkistama kärki, joten ohitettu tai peruttu
-ajo ([skip ci]) ei jätä aukkoa, ja historian muutos ajojen välissä hälyttää.
+Vertailupohja on edellisen tarkistuspisteen kärki: ajon, jonka tarkistus-vaihe
+valmistui. Ohitettu, peruttu tai ennen tarkistusta kaatunut ajo ei siis jätä aukkoa,
+ja historian muutos ajojen välissä hälyttää. GitHub Actionsissa valmis tarkistus
+palauttaa 0 ja kirjoittaa tuloksen (tulos=ok tai tulos=violation) GITHUB_OUTPUTiin;
+erillinen vaihe kaataa ajon hälytyksestä.
 """
 
 from __future__ import annotations
@@ -34,6 +41,8 @@ from typing import Any
 MAIN_BRANCH = "main"
 MAIN_REF = "refs/heads/main"
 WORKFLOW_FILE = "main-push-vahti.yml"
+CHECK_STEP = "tarkistus"
+MAX_CHECKPOINT_LOOKUPS = 10
 GITHUB_COMMITTER = "web-flow"
 BOT_LOGIN = "github-actions[bot]"
 ISSUE_TITLE = "Suora push mainiin"
@@ -165,14 +174,18 @@ def is_zero(sha: str) -> bool:
     return bool(sha) and set(sha) == {"0"}
 
 
-def merged_main_prs(prs: Any) -> list[int]:
+def merged_main_prs(prs: Any) -> list[dict[str, Any]]:
     """Palauttaa PR:t, jotka on yhdistetty ja joiden kohde on main."""
-    numbers = []
+    merged = []
     for pr in prs if isinstance(prs, list) else []:
         base = pr.get("base") or {}
         if pr.get("merged_at") and base.get("ref") == MAIN_BRANCH:
-            numbers.append(int(pr["number"]))
-    return sorted(numbers)
+            merged.append(pr)
+    return merged
+
+
+def head_sha(pr: dict[str, Any]) -> str:
+    return str((pr.get("head") or {}).get("sha") or "")
 
 
 def compare_commits(
@@ -195,11 +208,23 @@ def compare_commits(
         page += 1
 
 
-def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
-    """Edellisen valmistuneen vahtiajon kärki mainissa, tai tyhjä, jos ajoa ei ole.
+def check_step_done(api: GitHubApi, run_id: str) -> bool:
+    """Valmistuiko epäonnistuneen ajon tarkistus-vaihe (hälytys eikä keskeytys)."""
+    data = api.request("GET", f"/actions/runs/{run_id}/jobs", {"per_page": 30})
+    for job in (data or {}).get("jobs") or []:
+        for step in job.get("steps") or []:
+            if step.get("name") == CHECK_STEP and step.get("conclusion") == "success":
+                return True
+    return False
 
+
+def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
+    """Edellisen tarkistuspisteen kärki mainissa, tai tyhjä, jos ajoja ei ole.
+
+    Tarkistuspiste on onnistunut ajo tai epäonnistunut ajo, jonka tarkistus-vaihe
+    valmistui (hälytys). Ajo, joka kaatui ennen tarkistusta tai sen aikana, ei kelpaa.
     Vain tätä ajoa aiemmat ajot kelpaavat, jotta vanhan ajon uudelleenajo ei vertaa
-    myöhempään kärkeen.
+    myöhempään kärkeen. Jos ajoja on mutta yksikään ei kelpaa, nostetaan ApiError.
     """
     params = {
         "branch": MAIN_BRANCH,
@@ -215,9 +240,21 @@ def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
             continue
         if run_number and number >= run_number:
             continue
-        if run.get("conclusion") in ("success", "failure"):
-            runs.append((number, str(run.get("head_sha") or "")))
-    return max(runs)[1] if runs else ""
+        runs.append((number, run))
+    runs.sort(key=lambda item: item[0], reverse=True)
+    lookups = 0
+    for _, run in runs:
+        head = str(run.get("head_sha") or "")
+        if run.get("conclusion") == "success":
+            return head
+        if run.get("conclusion") != "failure" or lookups >= MAX_CHECKPOINT_LOOKUPS:
+            continue
+        lookups += 1
+        if check_step_done(api, str(run.get("id"))):
+            return head
+    if runs:
+        raise ApiError(0, "tarkistuspistettä ei löytynyt viimeisistä vahtiajoista")
+    return ""
 
 
 def choose_base(
@@ -333,6 +370,7 @@ def check_chain_and_prs(
     merge_like = not result.outside and reaches_base
     pending = [c for c in commits if c.get("sha")]
     result.checked = len(pending)
+    tip_prs: list[dict[str, Any]] = []
     for attempt, delay in enumerate((0, *delays)):
         if attempt and (not merge_like or len(pending) > RETRY_LIMIT):
             break
@@ -342,8 +380,11 @@ def check_chain_and_prs(
         for commit in pending:
             path_pulls = f"/commits/{commit['sha']}/pulls"
             prs = api.request("GET", path_pulls, {"per_page": PAGE_SIZE})
-            if not merged_main_prs(prs):
+            merged = merged_main_prs(prs)
+            if not merged:
                 missing.append(commit)
+            elif commit["sha"] == after:
+                tip_prs = merged
         pending = missing
         if not pending:
             break
@@ -352,6 +393,12 @@ def check_chain_and_prs(
         msg = f"{count} commitilla ei ole yhdistettyä PR:ää (kohde {MAIN_BRANCH})."
         result.reasons.append(msg)
         result.commits = [describe(c) for c in pending]
+    if tip_prs and all(head_sha(pr) == after for pr in tip_prs):
+        numbers = ", ".join(f"#{pr.get('number')}" for pr in tip_prs)
+        result.reasons.append(
+            f"Mainin kärki {after[:12]} on PR:n {numbers} oma head-commit eikä GitHubin "
+            "yhdistämisen luoma commit: PR-haara pushattiin suoraan mainiin."
+        )
 
 
 def check_push(
@@ -568,6 +615,19 @@ def run(
     return result.exit_code
 
 
+def finish(code: int, output_path: str | None) -> int:
+    """Actionsissa valmis tarkistus (0 tai 1) on 0, ja tulos menee GITHUB_OUTPUTiin.
+
+    Näin tarkistus-vaihe onnistuu aina, kun tarkistus valmistui, ja seuraava ajo voi
+    käyttää sitä tarkistuspisteenä. Hälytys-vaihe kaataa ajon tuloksen perusteella.
+    """
+    if not output_path or code not in (0, 1):
+        return code
+    with open(output_path, "a", encoding="utf-8") as fh:
+        fh.write("tulos=violation\n" if code == 1 else "tulos=ok\n")
+    return 0
+
+
 def main() -> int:
     event_path = os.environ.get("GITHUB_EVENT_PATH", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
@@ -588,7 +648,7 @@ def main() -> int:
         api = GitHubApi(api_url, repo, credential)
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         checkout_failed = os.environ.get("VAHTI_EDELLINEN_CHECKOUT") == "failure"
-        return run(
+        code = run(
             event,
             api,
             time.sleep,
@@ -600,6 +660,7 @@ def main() -> int:
             run_number,
             checkout_failed,
         )
+        return finish(code, os.environ.get("GITHUB_OUTPUT"))
     except Exception as err:  # noqa: BLE001
         name = type(err).__name__
         print(f"main-push-vahti: odottamaton virhe {name}; tarkistus ei valmistunut")

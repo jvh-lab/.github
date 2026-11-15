@@ -29,6 +29,7 @@ RUN_URL = "https://github.com/jvh-lab/esimerkki/actions/runs/1"
 BEFORE = "a" * 40
 OLD = "b" * 40
 PREV = "d" * 40
+PR_HEAD = "e" * 40
 ZERO = "0" * 40
 
 
@@ -50,11 +51,12 @@ def commit(n, parents, github=False, title="", author="Testaaja", verified=None)
     }
 
 
-def pr(number: int, merged: bool = True, base: str = "main") -> dict:
+def pr(number, merged=True, base="main", head=PR_HEAD):
     return {
         "number": number,
         "merged_at": "2026-11-14T20:00:00Z" if merged else None,
         "base": {"ref": base},
+        "head": {"sha": head},
     }
 
 
@@ -81,7 +83,7 @@ def merge_push(pr_number=5, pr_commits=2):
         parent = sha(n)
     title = f"Merge pull request #{pr_number}"
     commits.append(commit(1, [BEFORE, parent], github=True, title=title))
-    return commits, {c["sha"]: [pr(pr_number)] for c in commits}
+    return commits, {c["sha"]: [pr(pr_number, head=parent)] for c in commits}
 
 
 def run_entry(run_id, number, head, conclusion="success"):
@@ -106,6 +108,7 @@ class FakeApi:
         runs=None,
         prev_status="ahead",
         full=None,
+        jobs=None,
     ):
         self.commits = commits or []
         self.status = status
@@ -116,6 +119,8 @@ class FakeApi:
         self.runs = runs or []
         self.prev_status = prev_status
         self.full = full or {}
+        # jobs: ajon id -> tarkistus-vaiheen conclusion (oletus: valmis, eli hälytysajo).
+        self.jobs = jobs or {}
         self.calls = []
         self.created = []
         self.comments = []
@@ -127,6 +132,10 @@ class FakeApi:
                 raise vahti.ApiError(status, path)
         if path.startswith("/actions/workflows/"):
             return {"workflow_runs": self.runs}
+        if path.startswith("/actions/runs/") and path.endswith("/jobs"):
+            conclusion = self.jobs.get(int(path.split("/")[3]), "success")
+            step = {"name": "tarkistus", "conclusion": conclusion}
+            return {"jobs": [{"name": "vahti", "steps": [step]}]}
         if path.startswith("/compare/"):
             if params is None:
                 return {"status": self.prev_status}
@@ -316,6 +325,21 @@ class DirectPushes(unittest.TestCase):
         api = FakeApi(commits, {c["sha"]: [pr(42)] for c in commits})
         self.assertEqual(run_check(api)[0], 1)
 
+    def test_web_editor_pr_branch_pushed_to_main(self):
+        # Kaikki PR:n commitit ovat GitHubin allekirjoittamia (verkkoeditori), ja GitHub
+        # merkitsee PR:n epäsuorasti yhdistetyksi. Kärki on silti PR:n oma head.
+        commits = [commit(2, [BEFORE], github=True), commit(1, [sha(2)], github=True)]
+        pulls = {c["sha"]: [pr(42, head=sha(1))] for c in commits}
+        api = FakeApi(commits, pulls)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 1)
+        self.assertIn("oma head-commit", api.created[0]["body"])
+
+    def test_tip_head_check_accepts_any_real_merge(self):
+        commits, pulls = merge_push()
+        pulls[sha(1)] = [pr(9, head=sha(1)), pr(5, head=sha(3))]
+        self.assertEqual(run_check(FakeApi(commits, pulls))[0], 0)
+
     def test_forged_committer_without_signature(self):
         forged = commit(1, [BEFORE], github=True, verified=False)
         api = FakeApi([forged], {sha(1): [pr(5)]})
@@ -356,6 +380,43 @@ class DirectPushes(unittest.TestCase):
         body = api.created[0]["body"]
         self.assertIn("korjaus [skip ci]", body)
         self.assertIn("Vertailupohja", body)
+
+    def test_run_failed_before_check_is_not_checkpoint(self):
+        # Ketju: ohitettu [skip ci] -push D, seuraavan yhdistämisen B ajo kaatui ennen
+        # tarkistusta, ja nyt yhdistetään C. D tarkistetaan, koska B ei ole piste.
+        d = commit(20, [PREV], title="suora [skip ci]")
+        b_pr = commit(22, [sha(20)])
+        b = commit(21, [sha(20), sha(22)], github=True, title="Merge pull request #6")
+        c_pr = commit(2, [sha(21)])
+        c = commit(1, [sha(21), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {
+            sha(22): [pr(6, head=sha(22))],
+            sha(21): [pr(6, head=sha(22))],
+            sha(2): [pr(7, head=sha(2))],
+            sha(1): [pr(7, head=sha(2))],
+        }
+        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi([d, b_pr, b, c_pr, c], pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api, event(before=sha(21)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+        self.assertIn("suora [skip ci]", api.created[0]["body"])
+
+    def test_failure_run_with_completed_check_is_checkpoint(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "success"})
+        run_check(api)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+
+    def test_no_checkpoint_among_runs_is_incomplete(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, PREV, "failure"), run_entry(7, 7, OLD, "cancelled")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 2)
+        self.assertIn(f"/compare/{BEFORE}...{sha(1)}", api.paths("/compare/"))
+        self.assertIn("tarkistuspistettä ei löytynyt", api.created[0]["body"])
 
     def test_history_rewritten_between_runs_alarms(self):
         # Pakotettu push, jonka vahtiajo ohitettiin tai peruttiin.
@@ -580,6 +641,16 @@ class Errors(unittest.TestCase):
                 self.assertEqual(vahti.main(), 2)
         self.assertIn("odottamaton virhe KeyError", out.getvalue())
 
+    def test_finish_writes_result_for_completed_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(1, str(path)), 0)
+            self.assertEqual(vahti.finish(0, str(path)), 0)
+            self.assertEqual(vahti.finish(2, str(path)), 2)
+            text = path.read_text(encoding="utf-8")
+        self.assertEqual(text, "tulos=violation\ntulos=ok\n")
+        self.assertEqual(vahti.finish(1, None), 1)
+
     def test_summary_is_written(self):
         api = FakeApi([commit(1, [BEFORE])], {sha(1): []})
         with tempfile.TemporaryDirectory() as tmp:
@@ -741,6 +812,13 @@ class WorkflowFile(unittest.TestCase):
         self.assertIn(fallback, self.text)
         outcome = "VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}"
         self.assertIn(outcome, self.text)
+
+    def test_check_step_is_checkpoint_and_alarm_is_separate(self):
+        step = r"(?m)^      - name: tarkistus\n        id: tarkistus\n"
+        self.assertRegex(self.text, step)
+        alarm = "if: steps.tarkistus.outputs.tulos == 'violation'"
+        self.assertIn(alarm, self.text)
+        self.assertEqual(vahti.CHECK_STEP, "tarkistus")
 
     def test_actions_are_pinned_to_sha(self):
         uses = re.findall(r"uses: (\S+)", self.text)
