@@ -23,6 +23,10 @@ vahti = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = vahti
 SPEC.loader.exec_module(vahti)
 WORKFLOW = HERE.parent / "workflows" / "main-push-vahti.yml"
+LINUX_RUNNER = (
+    "${{ fromJSON(vars.JVH_LAB_LINUX_RUNS_ON || "
+    '\'["self-hosted","Linux","X64","jvh-lab-linux"]\') }}'
+)
 
 REPO = "jvh-lab/esimerkki"
 RUN_URL = "https://github.com/jvh-lab/esimerkki/actions/runs/1"
@@ -934,9 +938,13 @@ class WorkflowFile(unittest.TestCase):
     def test_triggers_and_runner(self):
         self.assertRegex(self.text, r"(?m)^  push:\n    branches: \[main\]\n")
         self.assertNotRegex(self.text, r"(?m)^\s+tags:")
-        self.assertNotIn("self-hosted", self.text)
-        runners = re.findall(r"runs-on: (\S+)", self.text)
-        self.assertEqual(runners, ["ubuntu-latest"] * 2)
+        # GitHubin ubuntu-latest (projektipohja) tai jvh-labin Linux-ajuri org-muuttujan
+        # oletuksella; molemmat jobit samalla ajurilla, ei Windows-ajuria.
+        runners = re.findall(r"(?m)^    runs-on: (.+)$", self.text)
+        self.assertEqual(len(runners), 2)
+        self.assertEqual(len(set(runners)), 1)
+        self.assertIn(runners[0], ("ubuntu-latest", LINUX_RUNNER))
+        self.assertNotIn("Windows", self.text)
 
     def test_minimal_permissions(self):
         self.assertRegex(self.text, r"(?m)^permissions: \{\}$")

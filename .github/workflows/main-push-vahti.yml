@@ -1,9 +1,11 @@
 # Main-push-vahti (agent-foundation D023 J2): jokaisen mainiin tulevan commitin on tultava yhdistetyn
 # PR:n kautta. Suora push (myös PR-haaran push mainiin tai pakotettu push) kaataa ajon ja avaa tai
-# kommentoi issueta "Suora push mainiin" (yksi avoin). Jälkitarkistus ei estä pushia. Ajo on GitHubin
-# isännöimällä Linux-koneella, ei omalla ajokoneella. Tiedosto ja .github/scripts/main_push_vahti.py
-# ovat tavulleen samat kaikissa jvh-labin repoissa ja project-templatessa. Itsetesti ajetaan PR:ssä
-# vain, kun vahdin tiedostot muuttuvat.
+# kommentoi issueta "Suora push mainiin" (yksi avoin). Jälkitarkistus ei estä pushia. Ajo on jvh-labin
+# omalla Linux-ajurilla; org-muuttuja JVH_LAB_LINUX_RUNS_ON (esim. '"ubuntu-latest"') voi palauttaa
+# sen GitHubiin. Tiedosto ja .github/scripts/main_push_vahti.py ovat tavulleen samat kaikissa
+# jvh-labin repoissa. project-templaten template/-kopio ajetaan GitHubin ubuntu-latestilla, koska
+# pohjasta luodaan projekteja muihin organisaatioihin. Itsetesti ajetaan PR:ssä vain, kun vahdin
+# tiedostot muuttuvat.
 name: main-push-vahti
 
 on:
@@ -25,7 +27,7 @@ concurrency:
 jobs:
   vahti:
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.JVH_LAB_LINUX_RUNS_ON || '["self-hosted","Linux","X64","jvh-lab-linux"]') }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -69,7 +71,7 @@ jobs:
 
   itsetesti:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.JVH_LAB_LINUX_RUNS_ON || '["self-hosted","Linux","X64","jvh-lab-linux"]') }}
     timeout-minutes: 10
     permissions:
       contents: read
