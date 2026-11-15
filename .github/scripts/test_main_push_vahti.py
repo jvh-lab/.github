@@ -133,9 +133,10 @@ class FakeApi:
         if path.startswith("/actions/workflows/"):
             return {"workflow_runs": self.runs}
         if path.startswith("/actions/runs/") and path.endswith("/jobs"):
-            conclusion = self.jobs.get(int(path.split("/")[3]), "success")
-            step = {"name": "tarkistus", "conclusion": conclusion}
-            return {"jobs": [{"name": "vahti", "steps": [step]}]}
+            value = self.jobs.get(int(path.split("/")[3]), "success")
+            steps = value if isinstance(value, dict) else {"tarkistus": value}
+            listed = [{"name": n, "conclusion": c} for n, c in steps.items()]
+            return {"jobs": [{"name": "vahti", "steps": listed}]}
         if path.startswith("/compare/"):
             if params is None:
                 return {"status": self.prev_status}
@@ -335,6 +336,36 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("oma head-commit", api.created[0]["body"])
 
+    def web_editor_head_then_merge(self):
+        # PR #42:n head A tehtiin verkkoeditorilla ja pushattiin suoraan mainiin.
+        # Sen jälkeen PR #7 yhdistettiin GitHubissa (merge M, ensimmäinen vanhempi A).
+        a = commit(20, [PREV], github=True, title="muutos [skip ci]")
+        c_pr = commit(2, [sha(20)])
+        m = commit(1, [sha(20), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {
+            sha(20): [pr(42, head=sha(20))],
+            sha(2): [pr(7, head=sha(2))],
+            sha(1): [pr(7, head=sha(2))],
+        }
+        return [a, c_pr, m], pulls
+
+    def test_web_editor_pr_head_skipped_by_skip_ci_is_found(self):
+        commits, pulls = self.web_editor_head_then_merge()
+        api = FakeApi(commits, pulls, runs=[run_entry(7, 7, PREV)])
+        code, _, _ = run_check(api, event(before=sha(20)))
+        self.assertEqual(code, 1)
+        body = api.created[0]["body"]
+        self.assertIn("oma head-commit", body)
+        self.assertIn(f"{sha(20)[:12]} (PR #42)", body)
+
+    def test_web_editor_pr_head_after_run_failed_before_check(self):
+        commits, pulls = self.web_editor_head_then_merge()
+        runs = [run_entry(8, 8, sha(20), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "skipped"})
+        code, _, _ = run_check(api, event(before=sha(20)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"{sha(20)[:12]} (PR #42)", api.created[0]["body"])
+
     def test_tip_head_check_accepts_any_real_merge(self):
         commits, pulls = merge_push()
         pulls[sha(1)] = [pr(9, head=sha(1)), pr(5, head=sha(3))]
@@ -409,14 +440,39 @@ class DirectPushes(unittest.TestCase):
         run_check(api)
         self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
 
-    def test_no_checkpoint_among_runs_is_incomplete(self):
+    def test_no_checkpoint_checks_this_push_and_reports_gap(self):
         commits, pulls = merge_push()
         runs = [run_entry(8, 8, PREV, "failure"), run_entry(7, 7, OLD, "cancelled")]
         api = FakeApi(commits, pulls, runs=runs, jobs={8: "failure"})
         code, _, _ = run_check(api)
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 3)
         self.assertIn(f"/compare/{BEFORE}...{sha(1)}", api.paths("/compare/"))
-        self.assertIn("tarkistuspistettä ei löytynyt", api.created[0]["body"])
+        self.assertEqual(len(api.paths("/commits/")), 3, "tämä push tarkistetaan")
+        self.assertIn("ei löytynyt tarkistuspistettä", api.created[0]["body"])
+
+    def test_gap_run_becomes_checkpoint_so_there_is_no_lock(self):
+        # Ajo #9 raportoi aukon (tulos=gap, tarkistus-vaihe onnistui), joten ajo #10
+        # käyttää sitä pisteenä eikä jää pysyvään keskeneräiseen tilaan.
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(3, str(output)), 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "tulos=gap\n")
+        commits, pulls = merge_push()
+        runs = [run_entry(9, 9, BEFORE, "failure"), run_entry(8, 8, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={9: "success", 8: "failure"})
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
+    def test_legacy_run_without_check_step_is_checkpoint_if_step_ran(self):
+        legacy = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: {legacy: "failure"}})
+        run_check(api)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+        skipped = FakeApi(commits, pulls, runs=runs, jobs={8: {legacy: "skipped"}})
+        self.assertEqual(run_check(skipped)[0], 3)
 
     def test_history_rewritten_between_runs_alarms(self):
         # Pakotettu push, jonka vahtiajo ohitettiin tai peruttiin.
@@ -650,6 +706,7 @@ class Errors(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
         self.assertEqual(text, "tulos=violation\ntulos=ok\n")
         self.assertEqual(vahti.finish(1, None), 1)
+        self.assertEqual(vahti.finish(3, None), 3)
 
     def test_summary_is_written(self):
         api = FakeApi([commit(1, [BEFORE])], {sha(1): []})
@@ -816,7 +873,10 @@ class WorkflowFile(unittest.TestCase):
     def test_check_step_is_checkpoint_and_alarm_is_separate(self):
         step = r"(?m)^      - name: tarkistus\n        id: tarkistus\n"
         self.assertRegex(self.text, step)
-        alarm = "if: steps.tarkistus.outputs.tulos == 'violation'"
+        alarm = (
+            "if: steps.tarkistus.outputs.tulos == 'violation' "
+            "|| steps.tarkistus.outputs.tulos == 'gap'"
+        )
         self.assertIn(alarm, self.text)
         self.assertEqual(vahti.CHECK_STEP, "tarkistus")
 

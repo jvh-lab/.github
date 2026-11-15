@@ -58,9 +58,9 @@ jobs:
           VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}
         run: python3 .github/scripts/main_push_vahti.py
       - name: hälytys
-        if: steps.tarkistus.outputs.tulos == 'violation'
+        if: steps.tarkistus.outputs.tulos == 'violation' || steps.tarkistus.outputs.tulos == 'gap'
         run: |
-          echo "::error title=main-push-vahti::Suora push mainiin, ks. issue Suora push mainiin."
+          echo "::error title=main-push-vahti::Hälytys, ks. issue Suora push mainiin."
           exit 1
 
   itsetesti:
