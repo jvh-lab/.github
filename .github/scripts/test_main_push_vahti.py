@@ -628,8 +628,9 @@ class Errors(unittest.TestCase):
     def test_compare_failure_on_forced_push_still_alarms(self):
         api = FakeApi(fail={"/compare/": 404})
         code, _, _ = run_check(api, event(forced=True))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2, "hälytys, mutta keskeneräinen")
         self.assertEqual(len(api.created), 1)
+        self.assertIn("Pakotettu push", api.created[0]["body"])
 
     def test_association_failure_is_error_and_reported(self):
         commits, _ = merge_push()
@@ -640,7 +641,34 @@ class Errors(unittest.TestCase):
 
     def test_association_failure_after_found_reason_alarms(self):
         api = FakeApi([commit(1, [BEFORE])], fail={"/commits/": 500})
-        self.assertEqual(run_check(api)[0], 1)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 2, "hälytys, mutta keskeneräinen ei ole piste")
+        self.assertIn("havaitsi mainissa muutoksen", api.created[0]["body"])
+        self.assertEqual(vahti.finish(code, None), 2)
+
+    def test_violation_with_incomplete_history_is_not_checkpoint(self):
+        # Codexin ketju: D suora [skip ci] -push, sitten suora push B, kun ajohistorian
+        # rajapinta palauttaa 503. B:n ajo hälyttää, mutta ei kelpaa pisteeksi, joten
+        # seuraava yhdistäminen C tarkistaa D:n.
+        b = commit(21, [sha(20)], title="suora push B")
+        api = FakeApi([b], {sha(21): []}, fail={"/actions/": 503})
+        code, _, _ = run_check(api, event(before=sha(20), after=sha(21)))
+        self.assertEqual(code, 2)
+        self.assertEqual(len(api.created), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(code, str(output)), 2)
+            self.assertFalse(output.exists(), "keskeneräinen ei kirjoita tulosta")
+        d = commit(20, [PREV], title="suora D [skip ci]")
+        c_pr = commit(2, [sha(21)])
+        c = commit(1, [sha(21), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {sha(2): [pr(7, head=sha(2))], sha(1): [pr(7, head=sha(2))]}
+        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi([d, b, c_pr, c], pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api, event(before=sha(21)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+        self.assertIn("suora D [skip ci]", api.created[0]["body"])
 
     def test_runs_api_failure_is_reported_but_push_is_checked(self):
         commits, pulls = merge_push()

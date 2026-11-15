@@ -2,10 +2,11 @@
 
 Jälkitarkistus (agent-foundation D023 J2). Ajetaan GitHub Actionsissa, kun mainiin
 pushataan. Vain vakiokirjasto. Paluukoodit: 0 = kunnossa tai ei tarkistettavaa,
-1 = suora push havaittu, 2 = tarkistus ei valmistunut, 3 = tämä push tarkistettiin,
+1 = suora push havaittu, 2 = tarkistus ei valmistunut (myös, jos samalla havaittiin
+rikkomus; hälytys raportoidaan silti), 3 = tämä push tarkistettiin,
 mutta edellistä tarkistuspistettä ei löytynyt (aiempi väli todentamatta).
 
-Kaksi ehtoa:
+Kolme ehtoa:
 1. Jokaisella pushin commitilla on PR-kytkentä
    (GET /repos/{owner}/{repo}/commits/{sha}/pulls) PR:ään, joka on yhdistetty
    (merged_at) ja jonka kohde on main.
@@ -167,6 +168,10 @@ class Result:
 
     @property
     def exit_code(self) -> int:
+        # Keskeneräinen tarkistus on aina 2, vaikka rikkomus havaittiin: hälytys
+        # raportoidaan, mutta ajo ei saa kelvata seuraavan ajon tarkistuspisteeksi.
+        if self.incomplete:
+            return 2
         return {"ok": 0, "skip": 0, "violation": 1, "gap": 3}.get(self.status, 2)
 
     def settle(self) -> Result:
