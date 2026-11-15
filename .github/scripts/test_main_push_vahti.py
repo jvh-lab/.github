@@ -30,6 +30,8 @@ BEFORE = "a" * 40
 OLD = "b" * 40
 PREV = "d" * 40
 PR_HEAD = "e" * 40
+# 0.11.0:n yhteinen tarkistus- ja hälytysvaihe.
+LEGACY = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
 ZERO = "0" * 40
 
 
@@ -109,6 +111,7 @@ class FakeApi:
         prev_status="ahead",
         full=None,
         jobs=None,
+        total=None,
     ):
         self.commits = commits or []
         self.status = status
@@ -119,8 +122,10 @@ class FakeApi:
         self.runs = runs or []
         self.prev_status = prev_status
         self.full = full or {}
-        # jobs: ajon id -> tarkistus-vaiheen conclusion (oletus: valmis, eli hälytysajo).
+        # jobs: ajon id -> tarkistuspiste-vaiheen conclusion tai {vaihe: conclusion}.
+        # Oletus: tarkistuspiste onnistui (uuden version valmis ajo).
         self.jobs = jobs or {}
+        self.total = total
         self.calls = []
         self.created = []
         self.comments = []
@@ -131,10 +136,11 @@ class FakeApi:
             if path.startswith(prefix):
                 raise vahti.ApiError(status, path)
         if path.startswith("/actions/workflows/"):
-            return {"workflow_runs": self.runs}
+            total = len(self.runs) if self.total is None else self.total
+            return {"workflow_runs": self.runs, "total_count": total}
         if path.startswith("/actions/runs/") and path.endswith("/jobs"):
             value = self.jobs.get(int(path.split("/")[3]), "success")
-            steps = value if isinstance(value, dict) else {"tarkistus": value}
+            steps = value if isinstance(value, dict) else {"tarkistuspiste": value}
             listed = [{"name": n, "conclusion": c} for n, c in steps.items()]
             return {"jobs": [{"name": "vahti", "steps": listed}]}
         if path.startswith("/compare/"):
@@ -464,25 +470,53 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
 
-    def test_legacy_failure_run_is_not_checkpoint(self):
-        # 0.11.0:n vaihe epäonnistui sekä hälytyksestä että keskeneräisyydestä (esim.
-        # 503), joten sen ajo ei kelpaa pisteeksi. Pohja on aiempi onnistunut ajo.
-        legacy = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
-        d = commit(20, [OLD], title="suora D [skip ci]")
-        b = commit(21, [sha(20)], github=True, title="Merge pull request #6")
-        pulls = {sha(21): [pr(6, head="f" * 40)]}
-        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, OLD)]
-        api = FakeApi([d, b], pulls, runs=runs, jobs={8: {legacy: "failure"}})
-        code, _, _ = run_check(api, event(before=sha(21), after=sha(21)))
-        self.assertIn(f"/compare/{OLD}...{sha(21)}", api.paths("/compare/"))
-        self.assertEqual(code, 1)
-        self.assertIn("suora D [skip ci]", api.created[0]["body"])
-
-    def test_only_legacy_failure_runs_give_gap_not_lock(self):
-        legacy = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
+    def test_transition_after_incomplete_legacy_run_reports_gap(self):
+        # A onnistunut 0.11.0-ajo, D suora [skip ci] -push, B 0.11.0-merge, jonka ajo
+        # kaatui 503:een (koodi 2), C päivitysmerge: uusi työnkulku ajaa 0.11.0-skriptin
+        # (tarkistus onnistuu, tarkistuspiste ohitetaan). E on uuden version ajo.
+        legacy = {LEGACY: "failure"}
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        old_ok = {LEGACY: "success"}
+        runs = [
+            run_entry(7, 7, BEFORE),
+            run_entry(6, 6, sha(21), "failure"),
+            run_entry(5, 5, PREV),
+        ]
         commits, pulls = merge_push()
-        runs = [run_entry(8, 8, PREV, "failure")]
-        api = FakeApi(commits, pulls, runs=runs, jobs={8: {legacy: "failure"}})
+        jobs = {7: update, 6: legacy, 5: old_ok}
+        api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 3, "D:tä ei voi todentaa, joten gap eikä hiljainen 0")
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+        self.assertIn("ei löytynyt tarkistuspistettä", api.created[0]["body"])
+
+    def test_transition_with_only_successful_legacy_runs_uses_latest(self):
+        # Kaikki 0.11.0-ajot onnistuivat ja lista on täydellinen: ketju on yhtenäinen.
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        old_ok = {LEGACY: "success"}
+        runs = [run_entry(7, 7, BEFORE), run_entry(6, 6, PREV), run_entry(5, 5, OLD)]
+        commits, pulls = merge_push()
+        jobs = {7: update, 6: old_ok, 5: old_ok}
+        api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
+    def test_transition_with_incomplete_run_list_reports_gap(self):
+        old_ok = {LEGACY: "success"}
+        commits, pulls = merge_push()
+        runs = [run_entry(6, 6, BEFORE)]
+        api = FakeApi(commits, pulls, runs=runs, jobs={6: old_ok}, total=31)
+        self.assertEqual(run_check(api)[0], 3)
+
+    def test_successful_run_without_checkpoint_step_needs_transition_rule(self):
+        # Uuden työnkulun onnistunut ajo, jossa tarkistuspiste ohitettiin, ei ole piste
+        # sellaisenaan; aiempi epäonnistunut ajo estää siirtymäsäännön.
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        legacy = {LEGACY: "failure"}
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, BEFORE), run_entry(7, 7, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: update, 7: legacy})
         self.assertEqual(run_check(api)[0], 3)
 
     def test_history_rewritten_between_runs_alarms(self):
@@ -912,12 +946,15 @@ class WorkflowFile(unittest.TestCase):
     def test_check_step_is_checkpoint_and_alarm_is_separate(self):
         step = r"(?m)^      - name: tarkistus\n        id: tarkistus\n"
         self.assertRegex(self.text, step)
+        point = "      - name: tarkistuspiste\n"
+        condition = "        if: steps.tarkistus.outputs.tulos != ''\n"
+        self.assertIn(point + condition, self.text)
         alarm = (
             "if: steps.tarkistus.outputs.tulos == 'violation' "
             "|| steps.tarkistus.outputs.tulos == 'gap'"
         )
         self.assertIn(alarm, self.text)
-        self.assertEqual(vahti.CHECK_STEP, "tarkistus")
+        self.assertEqual(vahti.CHECK_STEP, "tarkistuspiste")
 
     def test_actions_are_pinned_to_sha(self):
         uses = re.findall(r"uses: (\S+)", self.text)

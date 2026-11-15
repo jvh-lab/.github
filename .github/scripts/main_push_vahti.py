@@ -18,11 +18,12 @@ Kolme ehtoa:
    commitin, mutta PR-haaran suora push tuo ketjuun PR:n headin, vaikka sen commitit
    olisi tehty GitHubin verkkoeditorilla.
 
-Vertailupohja on edellisen tarkistuspisteen kärki: ajon, jonka tarkistus-vaihe
-valmistui. Ohitettu, peruttu tai ennen tarkistusta kaatunut ajo ei siis jätä aukkoa,
-ja historian muutos ajojen välissä hälyttää. GitHub Actionsissa valmis tarkistus
-palauttaa 0 ja kirjoittaa tuloksen (tulos=ok, tulos=violation tai tulos=gap)
-GITHUB_OUTPUTiin; erillinen vaihe kaataa ajon hälytyksestä.
+Vertailupohja on edellisen tarkistuspisteen kärki: ajon, jonka tarkistuspiste-vaihe
+onnistui (vain tämän version valmis tarkistus). Ohitettu, peruttu tai ennen
+tarkistusta kaatunut ajo ei siis jätä aukkoa, ja historian muutos ajojen välissä
+hälyttää. GitHub Actionsissa valmis tarkistus palauttaa 0 ja kirjoittaa tuloksen
+(tulos=ok, tulos=violation tai tulos=gap) GITHUB_OUTPUTiin; erillinen vaihe kaataa
+ajon hälytyksestä.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ from typing import Any
 MAIN_BRANCH = "main"
 MAIN_REF = "refs/heads/main"
 WORKFLOW_FILE = "main-push-vahti.yml"
-CHECK_STEP = "tarkistus"
+CHECK_STEP = "tarkistuspiste"
 MAX_CHECKPOINT_LOOKUPS = 10
 GITHUB_COMMITTER = "web-flow"
 BOT_LOGIN = "github-actions[bot]"
@@ -222,11 +223,12 @@ def compare_commits(
 
 
 def check_step_done(api: GitHubApi, run_id: str) -> bool:
-    """Valmistuiko epäonnistuneen ajon tarkistus-vaihe (hälytys eikä keskeytys).
+    """Onko ajossa onnistunut tarkistuspiste-vaihe.
 
-    Ennen 0.11.1:tä tarkistus ja hälytys olivat samassa vaiheessa, eikä sen
-    epäonnistumisesta voi erottaa hälytystä keskeneräisyydestä. Sellaisessa ajossa ei
-    ole tarkistus-vaihetta, joten se ei kelpaa pisteeksi (onnistunut ajo kelpaa).
+    Työnkulku ajaa vaiheen vain, kun skripti kirjoitti tuloksen (tulos=ok, violation
+    tai gap), eli vain tämän version valmis tarkistus. 0.11.0-skripti ei kirjoita
+    tulosta, joten sen ajo ei ole piste, vaikka se olisi onnistunut uudessa
+    työnkulussa (päivitysmergen oma ajo).
     """
     data = api.request("GET", f"/actions/runs/{run_id}/jobs", {"per_page": 30})
     for job in (data or {}).get("jobs") or []:
@@ -239,10 +241,14 @@ def check_step_done(api: GitHubApi, run_id: str) -> bool:
 def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
     """Edellisen tarkistuspisteen kärki mainissa, tai tyhjä, jos ajoja ei ole.
 
-    Tarkistuspiste on onnistunut ajo tai epäonnistunut ajo, jonka tarkistus-vaihe
-    valmistui (hälytys). Ajo, joka kaatui ennen tarkistusta tai sen aikana, ei kelpaa.
-    Vain tätä ajoa aiemmat ajot kelpaavat, jotta vanhan ajon uudelleenajo ei vertaa
-    myöhempään kärkeen. Jos ajoja on mutta yksikään ei kelpaa, nostetaan NoCheckpoint.
+    Tarkistuspiste on ajo, jonka tarkistuspiste-vaihe onnistui. Vain tätä ajoa
+    aiemmat ajot kelpaavat, jotta vanhan ajon uudelleenajo ei vertaa myöhempään
+    kärkeen. Jos ajoja on mutta yksikään ei kelpaa, nostetaan NoCheckpoint.
+
+    Siirtymä 0.11.0:sta: 0.11.0-ajot valitsivat pohjakseen edellisen onnistuneen tai
+    epäonnistuneen ajon. Jos ajolista on täydellinen eikä siinä ole yhtään
+    epäonnistunutta ajoa, ketju on yhtenäinen ensimmäisestä ajosta alkaen, ja
+    viimeisin onnistunut ajo kelpaa pisteeksi. Muuten tulos on NoCheckpoint (gap).
     """
     params = {
         "branch": MAIN_BRANCH,
@@ -251,28 +257,33 @@ def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
         "per_page": 30,
     }
     data = api.request("GET", f"/actions/workflows/{WORKFLOW_FILE}/runs", params)
+    listed = (data or {}).get("workflow_runs") or []
     runs = []
-    for run in (data or {}).get("workflow_runs") or []:
+    for run in listed:
         number = int(run.get("run_number") or 0)
         if str(run.get("id")) == run_id:
             continue
         if run_number and number >= run_number:
             continue
         runs.append((number, run))
+    if not runs:
+        return ""
     runs.sort(key=lambda item: item[0], reverse=True)
     lookups = 0
     for _, run in runs:
-        head = str(run.get("head_sha") or "")
-        if run.get("conclusion") == "success":
-            return head
-        if run.get("conclusion") != "failure" or lookups >= MAX_CHECKPOINT_LOOKUPS:
+        if run.get("conclusion") not in ("success", "failure"):
             continue
+        if lookups >= MAX_CHECKPOINT_LOOKUPS:
+            break
         lookups += 1
         if check_step_done(api, str(run.get("id"))):
-            return head
-    if runs:
-        raise NoCheckpoint()
-    return ""
+            return str(run.get("head_sha") or "")
+    complete = int((data or {}).get("total_count") or 0) <= len(listed)
+    no_failures = all(run.get("conclusion") != "failure" for _, run in runs)
+    successes = [run for _, run in runs if run.get("conclusion") == "success"]
+    if complete and no_failures and successes and lookups < MAX_CHECKPOINT_LOOKUPS:
+        return str(successes[0].get("head_sha") or "")
+    raise NoCheckpoint()
 
 
 def choose_base(
