@@ -49,11 +49,23 @@ jobs:
         with:
           persist-credentials: false
           sparse-checkout: .github/scripts
-      - name: PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille
+      # Vaihe "tarkistus" onnistuu, kun tarkistus valmistui (myös hälytys), ja kirjoittaa
+      # tuloksen. Vaihe "tarkistuspiste" ajetaan vain silloin, ja seuraava ajo käyttää sitä
+      # pisteenään. Keskeneräinen tarkistus kaataa vaiheen "tarkistus".
+      - name: tarkistus
+        id: tarkistus
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}
         run: python3 .github/scripts/main_push_vahti.py
+      - name: tarkistuspiste
+        if: steps.tarkistus.outputs.tulos != ''
+        run: echo "Tarkistus valmistui, ja ajo on seuraavan ajon tarkistuspiste."
+      - name: hälytys
+        if: steps.tarkistus.outputs.tulos == 'violation' || steps.tarkistus.outputs.tulos == 'gap'
+        run: |
+          echo "::error title=main-push-vahti::Hälytys, ks. issue Suora push mainiin."
+          exit 1
 
   itsetesti:
     if: github.event_name == 'pull_request'

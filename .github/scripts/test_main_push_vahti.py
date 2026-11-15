@@ -29,6 +29,9 @@ RUN_URL = "https://github.com/jvh-lab/esimerkki/actions/runs/1"
 BEFORE = "a" * 40
 OLD = "b" * 40
 PREV = "d" * 40
+PR_HEAD = "e" * 40
+# 0.11.0:n yhteinen tarkistus- ja hälytysvaihe.
+LEGACY = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
 ZERO = "0" * 40
 
 
@@ -50,11 +53,12 @@ def commit(n, parents, github=False, title="", author="Testaaja", verified=None)
     }
 
 
-def pr(number: int, merged: bool = True, base: str = "main") -> dict:
+def pr(number, merged=True, base="main", head=PR_HEAD):
     return {
         "number": number,
         "merged_at": "2026-11-14T20:00:00Z" if merged else None,
         "base": {"ref": base},
+        "head": {"sha": head},
     }
 
 
@@ -81,7 +85,7 @@ def merge_push(pr_number=5, pr_commits=2):
         parent = sha(n)
     title = f"Merge pull request #{pr_number}"
     commits.append(commit(1, [BEFORE, parent], github=True, title=title))
-    return commits, {c["sha"]: [pr(pr_number)] for c in commits}
+    return commits, {c["sha"]: [pr(pr_number, head=parent)] for c in commits}
 
 
 def run_entry(run_id, number, head, conclusion="success"):
@@ -106,6 +110,8 @@ class FakeApi:
         runs=None,
         prev_status="ahead",
         full=None,
+        jobs=None,
+        total=None,
     ):
         self.commits = commits or []
         self.status = status
@@ -116,6 +122,10 @@ class FakeApi:
         self.runs = runs or []
         self.prev_status = prev_status
         self.full = full or {}
+        # jobs: ajon id -> tarkistuspiste-vaiheen conclusion tai {vaihe: conclusion}.
+        # Oletus: tarkistuspiste onnistui (uuden version valmis ajo).
+        self.jobs = jobs or {}
+        self.total = total
         self.calls = []
         self.created = []
         self.comments = []
@@ -126,7 +136,13 @@ class FakeApi:
             if path.startswith(prefix):
                 raise vahti.ApiError(status, path)
         if path.startswith("/actions/workflows/"):
-            return {"workflow_runs": self.runs}
+            total = len(self.runs) if self.total is None else self.total
+            return {"workflow_runs": self.runs, "total_count": total}
+        if path.startswith("/actions/runs/") and path.endswith("/jobs"):
+            value = self.jobs.get(int(path.split("/")[3]), "success")
+            steps = value if isinstance(value, dict) else {"tarkistuspiste": value}
+            listed = [{"name": n, "conclusion": c} for n, c in steps.items()]
+            return {"jobs": [{"name": "vahti", "steps": listed}]}
         if path.startswith("/compare/"):
             if params is None:
                 return {"status": self.prev_status}
@@ -316,6 +332,51 @@ class DirectPushes(unittest.TestCase):
         api = FakeApi(commits, {c["sha"]: [pr(42)] for c in commits})
         self.assertEqual(run_check(api)[0], 1)
 
+    def test_web_editor_pr_branch_pushed_to_main(self):
+        # Kaikki PR:n commitit ovat GitHubin allekirjoittamia (verkkoeditori), ja GitHub
+        # merkitsee PR:n epäsuorasti yhdistetyksi. Kärki on silti PR:n oma head.
+        commits = [commit(2, [BEFORE], github=True), commit(1, [sha(2)], github=True)]
+        pulls = {c["sha"]: [pr(42, head=sha(1))] for c in commits}
+        api = FakeApi(commits, pulls)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 1)
+        self.assertIn("oma head-commit", api.created[0]["body"])
+
+    def web_editor_head_then_merge(self):
+        # PR #42:n head A tehtiin verkkoeditorilla ja pushattiin suoraan mainiin.
+        # Sen jälkeen PR #7 yhdistettiin GitHubissa (merge M, ensimmäinen vanhempi A).
+        a = commit(20, [PREV], github=True, title="muutos [skip ci]")
+        c_pr = commit(2, [sha(20)])
+        m = commit(1, [sha(20), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {
+            sha(20): [pr(42, head=sha(20))],
+            sha(2): [pr(7, head=sha(2))],
+            sha(1): [pr(7, head=sha(2))],
+        }
+        return [a, c_pr, m], pulls
+
+    def test_web_editor_pr_head_skipped_by_skip_ci_is_found(self):
+        commits, pulls = self.web_editor_head_then_merge()
+        api = FakeApi(commits, pulls, runs=[run_entry(7, 7, PREV)])
+        code, _, _ = run_check(api, event(before=sha(20)))
+        self.assertEqual(code, 1)
+        body = api.created[0]["body"]
+        self.assertIn("oma head-commit", body)
+        self.assertIn(f"{sha(20)[:12]} (PR #42)", body)
+
+    def test_web_editor_pr_head_after_run_failed_before_check(self):
+        commits, pulls = self.web_editor_head_then_merge()
+        runs = [run_entry(8, 8, sha(20), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "skipped"})
+        code, _, _ = run_check(api, event(before=sha(20)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"{sha(20)[:12]} (PR #42)", api.created[0]["body"])
+
+    def test_tip_head_check_accepts_any_real_merge(self):
+        commits, pulls = merge_push()
+        pulls[sha(1)] = [pr(9, head=sha(1)), pr(5, head=sha(3))]
+        self.assertEqual(run_check(FakeApi(commits, pulls))[0], 0)
+
     def test_forged_committer_without_signature(self):
         forged = commit(1, [BEFORE], github=True, verified=False)
         api = FakeApi([forged], {sha(1): [pr(5)]})
@@ -356,6 +417,121 @@ class DirectPushes(unittest.TestCase):
         body = api.created[0]["body"]
         self.assertIn("korjaus [skip ci]", body)
         self.assertIn("Vertailupohja", body)
+
+    def test_run_failed_before_check_is_not_checkpoint(self):
+        # Ketju: ohitettu [skip ci] -push D, seuraavan yhdistämisen B ajo kaatui ennen
+        # tarkistusta, ja nyt yhdistetään C. D tarkistetaan, koska B ei ole piste.
+        d = commit(20, [PREV], title="suora [skip ci]")
+        b_pr = commit(22, [sha(20)])
+        b = commit(21, [sha(20), sha(22)], github=True, title="Merge pull request #6")
+        c_pr = commit(2, [sha(21)])
+        c = commit(1, [sha(21), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {
+            sha(22): [pr(6, head=sha(22))],
+            sha(21): [pr(6, head=sha(22))],
+            sha(2): [pr(7, head=sha(2))],
+            sha(1): [pr(7, head=sha(2))],
+        }
+        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi([d, b_pr, b, c_pr, c], pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api, event(before=sha(21)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+        self.assertIn("suora [skip ci]", api.created[0]["body"])
+
+    def test_failure_run_with_completed_check_is_checkpoint(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "success"})
+        run_check(api)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+
+    def test_no_checkpoint_checks_this_push_and_reports_gap(self):
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, PREV, "failure"), run_entry(7, 7, OLD, "cancelled")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 3)
+        self.assertIn(f"/compare/{BEFORE}...{sha(1)}", api.paths("/compare/"))
+        self.assertEqual(len(api.paths("/commits/")), 3, "tämä push tarkistetaan")
+        self.assertIn("ei löytynyt tarkistuspistettä", api.created[0]["body"])
+
+    def test_gap_run_becomes_checkpoint_so_there_is_no_lock(self):
+        # Ajo #9 raportoi aukon (tulos=gap, tarkistus-vaihe onnistui), joten ajo #10
+        # käyttää sitä pisteenä eikä jää pysyvään keskeneräiseen tilaan.
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(3, str(output)), 0)
+            self.assertEqual(output.read_text(encoding="utf-8"), "tulos=gap\n")
+        commits, pulls = merge_push()
+        runs = [run_entry(9, 9, BEFORE, "failure"), run_entry(8, 8, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={9: "success", 8: "failure"})
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
+    def test_transition_after_incomplete_legacy_run_reports_gap(self):
+        # A onnistunut 0.11.0-ajo, D suora [skip ci] -push, B 0.11.0-merge, jonka ajo
+        # kaatui 503:een (koodi 2), C päivitysmerge: uusi työnkulku ajaa 0.11.0-skriptin
+        # (tarkistus onnistuu, tarkistuspiste ohitetaan). E on uuden version ajo.
+        legacy = {LEGACY: "failure"}
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        old_ok = {LEGACY: "success"}
+        runs = [
+            run_entry(7, 7, BEFORE),
+            run_entry(6, 6, sha(21), "failure"),
+            run_entry(5, 5, PREV),
+        ]
+        commits, pulls = merge_push()
+        jobs = {7: update, 6: legacy, 5: old_ok}
+        api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 3, "D:tä ei voi todentaa, joten gap eikä hiljainen 0")
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+        self.assertIn("ei löytynyt tarkistuspistettä", api.created[0]["body"])
+
+    def test_transition_with_only_successful_legacy_runs_uses_latest(self):
+        # Kaikki 0.11.0-ajot onnistuivat ja lista on täydellinen: ketju on yhtenäinen.
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        old_ok = {LEGACY: "success"}
+        runs = [run_entry(7, 7, BEFORE), run_entry(6, 6, PREV), run_entry(5, 5, OLD)]
+        commits, pulls = merge_push()
+        jobs = {7: update, 6: old_ok, 5: old_ok}
+        api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 0)
+        self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+
+    def test_transition_rule_does_not_depend_on_lookup_limit(self):
+        # Codex: 10 onnistunutta 0.11.0-ajoa täytti jobs-hakujen rajan ja antoi gapin.
+        old_ok = {LEGACY: "success"}
+        commits, pulls = merge_push()
+        for count in (9, 10, 11):
+            heads = {n: BEFORE if n == count else OLD for n in range(1, count + 1)}
+            runs = [run_entry(n, n, heads[n]) for n in range(count, 0, -1)]
+            jobs = {n: old_ok for n in range(1, count + 1)}
+            api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+            self.assertEqual(run_check(api, run_number=count + 1)[0], 0, count)
+            self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+            lookups = [p for p in api.paths("/actions/runs/") if p.endswith("/jobs")]
+            self.assertLessEqual(len(lookups), vahti.MAX_CHECKPOINT_LOOKUPS)
+
+    def test_transition_with_incomplete_run_list_reports_gap(self):
+        old_ok = {LEGACY: "success"}
+        commits, pulls = merge_push()
+        runs = [run_entry(6, 6, BEFORE)]
+        api = FakeApi(commits, pulls, runs=runs, jobs={6: old_ok}, total=31)
+        self.assertEqual(run_check(api)[0], 3)
+
+    def test_successful_run_without_checkpoint_step_needs_transition_rule(self):
+        # Uuden työnkulun onnistunut ajo, jossa tarkistuspiste ohitettiin, ei ole piste
+        # sellaisenaan; aiempi epäonnistunut ajo estää siirtymäsäännön.
+        update = {"tarkistus": "success", "tarkistuspiste": "skipped"}
+        legacy = {LEGACY: "failure"}
+        commits, pulls = merge_push()
+        runs = [run_entry(8, 8, BEFORE), run_entry(7, 7, PREV, "failure")]
+        api = FakeApi(commits, pulls, runs=runs, jobs={8: update, 7: legacy})
+        self.assertEqual(run_check(api)[0], 3)
 
     def test_history_rewritten_between_runs_alarms(self):
         # Pakotettu push, jonka vahtiajo ohitettiin tai peruttiin.
@@ -511,8 +687,9 @@ class Errors(unittest.TestCase):
     def test_compare_failure_on_forced_push_still_alarms(self):
         api = FakeApi(fail={"/compare/": 404})
         code, _, _ = run_check(api, event(forced=True))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2, "hälytys, mutta keskeneräinen")
         self.assertEqual(len(api.created), 1)
+        self.assertIn("Pakotettu push", api.created[0]["body"])
 
     def test_association_failure_is_error_and_reported(self):
         commits, _ = merge_push()
@@ -523,7 +700,34 @@ class Errors(unittest.TestCase):
 
     def test_association_failure_after_found_reason_alarms(self):
         api = FakeApi([commit(1, [BEFORE])], fail={"/commits/": 500})
-        self.assertEqual(run_check(api)[0], 1)
+        code, _, _ = run_check(api)
+        self.assertEqual(code, 2, "hälytys, mutta keskeneräinen ei ole piste")
+        self.assertIn("havaitsi mainissa muutoksen", api.created[0]["body"])
+        self.assertEqual(vahti.finish(code, None), 2)
+
+    def test_violation_with_incomplete_history_is_not_checkpoint(self):
+        # Codexin ketju: D suora [skip ci] -push, sitten suora push B, kun ajohistorian
+        # rajapinta palauttaa 503. B:n ajo hälyttää, mutta ei kelpaa pisteeksi, joten
+        # seuraava yhdistäminen C tarkistaa D:n.
+        b = commit(21, [sha(20)], title="suora push B")
+        api = FakeApi([b], {sha(21): []}, fail={"/actions/": 503})
+        code, _, _ = run_check(api, event(before=sha(20), after=sha(21)))
+        self.assertEqual(code, 2)
+        self.assertEqual(len(api.created), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(code, str(output)), 2)
+            self.assertFalse(output.exists(), "keskeneräinen ei kirjoita tulosta")
+        d = commit(20, [PREV], title="suora D [skip ci]")
+        c_pr = commit(2, [sha(21)])
+        c = commit(1, [sha(21), sha(2)], github=True, title="Merge pull request #7")
+        pulls = {sha(2): [pr(7, head=sha(2))], sha(1): [pr(7, head=sha(2))]}
+        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, PREV)]
+        api = FakeApi([d, b, c_pr, c], pulls, runs=runs, jobs={8: "failure"})
+        code, _, _ = run_check(api, event(before=sha(21)))
+        self.assertEqual(code, 1)
+        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
+        self.assertIn("suora D [skip ci]", api.created[0]["body"])
 
     def test_runs_api_failure_is_reported_but_push_is_checked(self):
         commits, pulls = merge_push()
@@ -579,6 +783,17 @@ class Errors(unittest.TestCase):
             ):
                 self.assertEqual(vahti.main(), 2)
         self.assertIn("odottamaton virhe KeyError", out.getvalue())
+
+    def test_finish_writes_result_for_completed_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "output.txt"
+            self.assertEqual(vahti.finish(1, str(path)), 0)
+            self.assertEqual(vahti.finish(0, str(path)), 0)
+            self.assertEqual(vahti.finish(2, str(path)), 2)
+            text = path.read_text(encoding="utf-8")
+        self.assertEqual(text, "tulos=violation\ntulos=ok\n")
+        self.assertEqual(vahti.finish(1, None), 1)
+        self.assertEqual(vahti.finish(3, None), 3)
 
     def test_summary_is_written(self):
         api = FakeApi([commit(1, [BEFORE])], {sha(1): []})
@@ -741,6 +956,19 @@ class WorkflowFile(unittest.TestCase):
         self.assertIn(fallback, self.text)
         outcome = "VAHTI_EDELLINEN_CHECKOUT: ${{ steps.edellinen.outcome }}"
         self.assertIn(outcome, self.text)
+
+    def test_check_step_is_checkpoint_and_alarm_is_separate(self):
+        step = r"(?m)^      - name: tarkistus\n        id: tarkistus\n"
+        self.assertRegex(self.text, step)
+        point = "      - name: tarkistuspiste\n"
+        condition = "        if: steps.tarkistus.outputs.tulos != ''\n"
+        self.assertIn(point + condition, self.text)
+        alarm = (
+            "if: steps.tarkistus.outputs.tulos == 'violation' "
+            "|| steps.tarkistus.outputs.tulos == 'gap'"
+        )
+        self.assertIn(alarm, self.text)
+        self.assertEqual(vahti.CHECK_STEP, "tarkistuspiste")
 
     def test_actions_are_pinned_to_sha(self):
         uses = re.findall(r"uses: (\S+)", self.text)
