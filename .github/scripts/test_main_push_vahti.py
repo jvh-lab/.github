@@ -464,15 +464,26 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
 
-    def test_legacy_run_without_check_step_is_checkpoint_if_step_ran(self):
+    def test_legacy_failure_run_is_not_checkpoint(self):
+        # 0.11.0:n vaihe epäonnistui sekä hälytyksestä että keskeneräisyydestä (esim.
+        # 503), joten sen ajo ei kelpaa pisteeksi. Pohja on aiempi onnistunut ajo.
+        legacy = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
+        d = commit(20, [OLD], title="suora D [skip ci]")
+        b = commit(21, [sha(20)], github=True, title="Merge pull request #6")
+        pulls = {sha(21): [pr(6, head="f" * 40)]}
+        runs = [run_entry(8, 8, sha(21), "failure"), run_entry(7, 7, OLD)]
+        api = FakeApi([d, b], pulls, runs=runs, jobs={8: {legacy: "failure"}})
+        code, _, _ = run_check(api, event(before=sha(21), after=sha(21)))
+        self.assertIn(f"/compare/{OLD}...{sha(21)}", api.paths("/compare/"))
+        self.assertEqual(code, 1)
+        self.assertIn("suora D [skip ci]", api.created[0]["body"])
+
+    def test_only_legacy_failure_runs_give_gap_not_lock(self):
         legacy = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
         commits, pulls = merge_push()
         runs = [run_entry(8, 8, PREV, "failure")]
         api = FakeApi(commits, pulls, runs=runs, jobs={8: {legacy: "failure"}})
-        run_check(api)
-        self.assertIn(f"/compare/{PREV}...{sha(1)}", api.paths("/compare/"))
-        skipped = FakeApi(commits, pulls, runs=runs, jobs={8: {legacy: "skipped"}})
-        self.assertEqual(run_check(skipped)[0], 3)
+        self.assertEqual(run_check(api)[0], 3)
 
     def test_history_rewritten_between_runs_alarms(self):
         # Pakotettu push, jonka vahtiajo ohitettiin tai peruttiin.

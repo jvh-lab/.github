@@ -44,8 +44,6 @@ MAIN_BRANCH = "main"
 MAIN_REF = "refs/heads/main"
 WORKFLOW_FILE = "main-push-vahti.yml"
 CHECK_STEP = "tarkistus"
-# Ennen 0.11.1:tä tarkistus ja hälytys olivat samassa vaiheessa.
-LEGACY_STEP = "PR-kytkentä ja GitHubin yhdistäminen jokaiselle commitille"
 MAX_CHECKPOINT_LOOKUPS = 10
 GITHUB_COMMITTER = "web-flow"
 BOT_LOGIN = "github-actions[bot]"
@@ -156,7 +154,7 @@ class GitHubApi:
 
 @dataclass
 class Result:
-    status: str  # ok, skip, violation tai error
+    status: str  # ok, skip, violation, gap tai error
     notes: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     incomplete: list[str] = field(default_factory=list)
@@ -175,7 +173,7 @@ class Result:
         return {"ok": 0, "skip": 0, "violation": 1, "gap": 3}.get(self.status, 2)
 
     def settle(self) -> Result:
-        """Hälytys voittaa keskeneräisyyden; keskeneräinen ei ole kunnossa."""
+        """Tila: hälytys voittaa keskeneräisyyden (paluukoodi on silti 2, ks. exit_code)."""
         if self.reasons:
             self.status = "violation"
         elif self.incomplete:
@@ -226,16 +224,14 @@ def compare_commits(
 def check_step_done(api: GitHubApi, run_id: str) -> bool:
     """Valmistuiko epäonnistuneen ajon tarkistus-vaihe (hälytys eikä keskeytys).
 
-    Ennen 0.11.1:tä tarkistus ja hälytys olivat yhdessä vaiheessa. Sellainen ajo on
-    piste, jos vaihe ajettiin (kuten 0.11.0:ssa), mutta ei, jos se ohitettiin.
+    Ennen 0.11.1:tä tarkistus ja hälytys olivat samassa vaiheessa, eikä sen
+    epäonnistumisesta voi erottaa hälytystä keskeneräisyydestä. Sellaisessa ajossa ei
+    ole tarkistus-vaihetta, joten se ei kelpaa pisteeksi (onnistunut ajo kelpaa).
     """
     data = api.request("GET", f"/actions/runs/{run_id}/jobs", {"per_page": 30})
     for job in (data or {}).get("jobs") or []:
         for step in job.get("steps") or []:
-            name, conclusion = step.get("name"), step.get("conclusion")
-            if name == CHECK_STEP and conclusion == "success":
-                return True
-            if name == LEGACY_STEP and conclusion in ("success", "failure"):
+            if step.get("name") == CHECK_STEP and step.get("conclusion") == "success":
                 return True
     return False
 
