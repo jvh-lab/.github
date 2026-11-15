@@ -502,6 +502,20 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
 
+    def test_transition_rule_does_not_depend_on_lookup_limit(self):
+        # Codex: 10 onnistunutta 0.11.0-ajoa täytti jobs-hakujen rajan ja antoi gapin.
+        old_ok = {LEGACY: "success"}
+        commits, pulls = merge_push()
+        for count in (9, 10, 11):
+            heads = {n: BEFORE if n == count else OLD for n in range(1, count + 1)}
+            runs = [run_entry(n, n, heads[n]) for n in range(count, 0, -1)]
+            jobs = {n: old_ok for n in range(1, count + 1)}
+            api = FakeApi(commits, pulls, runs=runs, jobs=jobs)
+            self.assertEqual(run_check(api, run_number=count + 1)[0], 0, count)
+            self.assertEqual(api.paths("/compare/"), [f"/compare/{BEFORE}...{sha(1)}"])
+            lookups = [p for p in api.paths("/actions/runs/") if p.endswith("/jobs")]
+            self.assertLessEqual(len(lookups), vahti.MAX_CHECKPOINT_LOOKUPS)
+
     def test_transition_with_incomplete_run_list_reports_gap(self):
         old_ok = {LEGACY: "success"}
         commits, pulls = merge_push()

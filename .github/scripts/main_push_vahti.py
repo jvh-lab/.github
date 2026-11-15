@@ -281,7 +281,7 @@ def previous_checked_head(api: GitHubApi, run_id: str, run_number: int) -> str:
     complete = int((data or {}).get("total_count") or 0) <= len(listed)
     no_failures = all(run.get("conclusion") != "failure" for _, run in runs)
     successes = [run for _, run in runs if run.get("conclusion") == "success"]
-    if complete and no_failures and successes and lookups < MAX_CHECKPOINT_LOOKUPS:
+    if complete and no_failures and successes:
         return str(successes[0].get("head_sha") or "")
     raise NoCheckpoint()
 
@@ -669,8 +669,9 @@ def run(
 def finish(code: int, output_path: str | None) -> int:
     """Actionsissa valmis tarkistus (0, 1 tai 3) on 0; tulos menee GITHUB_OUTPUTiin.
 
-    Näin tarkistus-vaihe onnistuu aina, kun tarkistus valmistui, ja seuraava ajo voi
-    käyttää sitä tarkistuspisteenä. Hälytys-vaihe kaataa ajon tuloksen perusteella.
+    Näin tarkistus-vaihe onnistuu aina, kun tarkistus valmistui, ja tuloksen
+    kirjoittaminen käynnistää tarkistuspiste-vaiheen, jota seuraava ajo käyttää
+    pisteenään. Hälytys-vaihe kaataa ajon tuloksen perusteella.
     """
     results = {0: "ok", 1: "violation", 3: "gap"}
     if not output_path or code not in results:
